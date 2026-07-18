@@ -84,6 +84,26 @@ random_hex() {
 		| tr -d ' \n'
 }
 
+generate_password() {
+	while :; do
+		password=$(tr -dc 'A-Za-z0-9!@#%&_=+^-' < /dev/urandom \
+			| dd bs=1 count=17 2> /dev/null)
+
+		[ "${#password}" -eq 17 ] || continue
+
+		case $password in *[A-Z]*) ;; *) continue ;; esac
+		case $password in *[a-z]*) ;; *) continue ;; esac
+		case $password in *[0-9]*) ;; *) continue ;; esac
+		case $password in
+			*'!'* | *'@'* | *'#'* | *'%'* | *'&'* | *'_'* | *'='* | *'+'* | *'^'* | *'-'*) ;;
+			*) continue ;;
+		esac
+
+		printf '%s\n' "$password"
+		return 0
+	done
+}
+
 urlencode() {
 	# Percent-encode an ASCII string according to RFC 3986.
 	value=$1
@@ -336,7 +356,7 @@ database_exists() {
 user_exists() {
 	database_user=$1
 	mariadb --protocol=socket --batch --skip-column-names \
-		-e "SELECT User FROM mysql.user WHERE User = '$database_user' AND Host = '127.0.0.1';" \
+		-e "SELECT User FROM mysql.user WHERE User = '$database_user' AND Host IN ('127.0.0.1', 'localhost');" \
 		2> /dev/null | grep -Fx "$database_user" > /dev/null 2>&1
 }
 
@@ -404,18 +424,18 @@ prompt_installation_ports() {
 	MARIADB_PORT=${MARIADB_PORT:-3306}
 
 	case $PHPMYADMIN_PORT in
-		'' | *[!0-9]*) fail 'PHPMYADMIN_PORT must be an integer from 1 to 65535.' ;;
+		'' | *[!0-9]*) fail 'phpMyAdmin Port must be an integer from 1 to 65535.' ;;
 	esac
 	[ "$PHPMYADMIN_PORT" -ge 1 ] 2> /dev/null \
 		&& [ "$PHPMYADMIN_PORT" -le 65535 ] 2> /dev/null \
-		|| fail 'PHPMYADMIN_PORT must be an integer from 1 to 65535.'
+		|| fail 'phpMyAdmin Port must be an integer from 1 to 65535.'
 
 	case $MARIADB_PORT in
-		'' | *[!0-9]*) fail 'MARIADB_PORT must be an integer from 1 to 65535.' ;;
+		'' | *[!0-9]*) fail 'MariaDB Port must be an integer from 1 to 65535.' ;;
 	esac
 	[ "$MARIADB_PORT" -ge 1 ] 2> /dev/null \
 		&& [ "$MARIADB_PORT" -le 65535 ] 2> /dev/null \
-		|| fail 'MARIADB_PORT must be an integer from 1 to 65535.'
+		|| fail 'MariaDB Port must be an integer from 1 to 65535.'
 
 	if port_is_in_use "$PHPMYADMIN_PORT"; then
 		warn "phpMyAdmin Port $PHPMYADMIN_PORT is currently in use."
@@ -676,6 +696,19 @@ deploy() {
 	systemctl enable "$PHPMYADMIN_SERVICE" > /dev/null 2>&1
 	systemctl restart "$PHPMYADMIN_SERVICE"
 
+	listener_attempt=0
+	while ! port_is_in_use "$PHPMYADMIN_PORT"; do
+		listener_attempt=$((listener_attempt + 1))
+
+		if systemctl is-failed --quiet "$PHPMYADMIN_SERVICE" \
+			|| [ "$listener_attempt" -ge 15 ]; then
+			systemctl status "$PHPMYADMIN_SERVICE" --no-pager >&2 || true
+			fail "phpMyAdmin did not start listening on $PHPMYADMIN_ADDRESS:$PHPMYADMIN_PORT."
+		fi
+
+		sleep 1
+	done
+
 	HEALTH_FILE="$STATE_DIR/phpmyadmin-health.html"
 	if ! curl -fsS \
 		--retry 10 \
@@ -696,8 +729,8 @@ deploy() {
 
 	app=$(select_new_database_name)
 	user=$(select_new_database_user)
-	DB_PASSWORD="$(random_hex 24)!@#"
-	[ "${#DB_PASSWORD}" -ge 51 ] || fail 'Unable to generate a strong database password.'
+	DB_PASSWORD=$(generate_password)
+	[ "${#DB_PASSWORD}" -eq 17 ] || fail 'Unable to generate a strong database password.'
 
 	# Record ownership before SQL execution so a partial deployment remains removable.
 	printf '%s\n' "$app" > "$DATABASE_FILE"
@@ -709,7 +742,9 @@ deploy() {
 		    CHARACTER SET utf8mb4
 		    COLLATE utf8mb4_unicode_ci;
 		CREATE USER '$user'@'127.0.0.1' IDENTIFIED BY '$DB_PASSWORD';
+		CREATE USER '$user'@'localhost' IDENTIFIED BY '$DB_PASSWORD';
 		GRANT ALL PRIVILEGES ON \`$app\`.* TO '$user'@'127.0.0.1';
+		GRANT ALL PRIVILEGES ON \`$app\`.* TO '$user'@'localhost';
 		FLUSH PRIVILEGES;
 	DATABASE
 
@@ -726,6 +761,8 @@ deploy() {
 
 	info 'Installation completed successfully.'
 	info "phpMyAdmin is listening only at http://$PHPMYADMIN_ADDRESS:$PHPMYADMIN_PORT/"
+	printf 'phpMyAdmin username: %s\n' "$user"
+	printf 'phpMyAdmin password: %s\n' "$DB_PASSWORD"
 	printf 'mysql://%s:%s@127.0.0.1:%s/%s\n' "$user" "$ENCODED_PASSWORD" "$MARIADB_PORT" "$app"
 }
 
@@ -799,11 +836,11 @@ uninstall() {
 		fi
 
 		if [ "$remove_user" = yes ]; then
-			info "Dropping user '$managed_user'@'127.0.0.1'"
+			info "Dropping loopback users for '$managed_user'"
 			mariadb --protocol=socket \
-				-e "DROP USER IF EXISTS '$managed_user'@'127.0.0.1'; FLUSH PRIVILEGES;"
+				-e "DROP USER IF EXISTS '$managed_user'@'127.0.0.1', '$managed_user'@'localhost'; FLUSH PRIVILEGES;"
 		else
-			info "Keeping user '$managed_user'@'127.0.0.1'"
+			info "Keeping loopback users for '$managed_user'"
 		fi
 	fi
 
@@ -853,7 +890,7 @@ uninstall() {
 		info "Database retained: $managed_database"
 	fi
 	if [ "$remove_user" != yes ] && [ -n "$managed_user" ]; then
-		info "Database user retained: $managed_user@127.0.0.1"
+		info "Database loopback users retained: $managed_user"
 	fi
 }
 

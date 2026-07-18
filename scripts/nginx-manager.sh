@@ -3430,7 +3430,8 @@ choose_next_action() {
 	fi
 
 	while :; do
-		printf 'Choose what to do next: 1) Manage existing configurations — select a listener, server, or upstream shown above to modify its port or remove that node; 2) Add new configuration — create a new public 80/443 or custom-port setup without changing an existing node.\n\n'
+		printf 'Choose what to do next:\n\n  1) Manage existing configurations — select a listener, server, or upstream shown above to modify its port or remove that node'
+		printf '\n  2) Add new configuration — create a new public 80/443 or custom-port setup without changing an existing node\n\n'
 		printf 'Select an action [1-2]: '
 		if ! IFS= read -r cna_choice; then
 			fatal "Input ended before the next action was selected."

@@ -1,0 +1,2400 @@
+#!/bin/sh
+
+# nginx-manager.sh
+#
+# Copyright 2026 Pouria Rezaei <Pouria.rz@outlook.com>
+# All rights reserved.
+#
+# Redistribution and use of this script, with or without modification, is
+# permitted provided that the following conditions are met:
+#
+# 1. Redistributions of this script must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+#
+#  THIS SOFTWARE IS PROVIDED BY THE AUTHOR "AS IS" AND ANY EXPRESS OR IMPLIED
+#  WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+#  MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO
+#  EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+#  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+#  PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
+#  OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+#  WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
+#  OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
+#  ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+set -u
+
+umask 022
+
+log_info() {
+	printf '\033[34m\033[1m[INFO]\033[0m %s\n' "$*"
+}
+
+log_success() {
+	printf '\033[32m\033[1m[SUCCESS]\033[0m %s\n' "$*"
+}
+
+log_warn() {
+	printf '\033[33m\033[1m[WARNING]\033[0m %s\n' "$*" >&2
+}
+
+log_error() {
+	printf '\033[31m\033[1m[ERROR]\033[0m %s\n' "$*" >&2
+}
+
+cleanup_temp() {
+	if [ -n "${CURRENT_TMP:-}" ] && [ -e "$CURRENT_TMP" ]; then
+		rm -f "$CURRENT_TMP" 2> /dev/null || :
+	fi
+	unset CURRENT_TMP
+}
+
+fatal() {
+	cleanup_temp
+	log_error "$*"
+
+	if [ "${TRANSACTION_ACTIVE:-0}" -eq 1 ] \
+		&& [ "${ROLLBACK_DONE:-0}" -eq 0 ]; then
+		rollback_transaction
+	fi
+
+	exit 1
+}
+
+run_or_die() {
+	rod_description=$1
+	shift
+
+	log_info "$rod_description"
+	if ! "$@"; then
+		fatal "Command failed: $rod_description"
+	fi
+
+	unset rod_description
+}
+
+confirm() {
+	cf_prompt=$1
+	cf_default=${2:-no}
+
+	while :; do
+		if [ "$cf_default" = yes ]; then
+			printf '%s [Y/n]: ' "$cf_prompt"
+		else
+			printf '%s [y/N]: ' "$cf_prompt"
+		fi
+
+		if ! IFS= read -r cf_answer; then
+			printf '\n'
+			unset cf_prompt cf_default cf_answer
+			return 1
+		fi
+
+		case $cf_answer in
+			'')
+				if [ "$cf_default" = yes ]; then
+					unset cf_prompt cf_default cf_answer
+					return 0
+				fi
+				unset cf_prompt cf_default cf_answer
+				return 1
+				;;
+			y | Y | yes | YES | Yes)
+				unset cf_prompt cf_default cf_answer
+				return 0
+				;;
+			n | N | no | NO | No)
+				unset cf_prompt cf_default cf_answer
+				return 1
+				;;
+			*)
+				log_warn "Please answer yes or no."
+				;;
+		esac
+	done
+}
+
+prompt_ipv6_support() {
+	if confirm "Enable IPv6 support?" no; then
+		IPV6_ENABLED=1
+		IPV6_LISTEN_PREFIX=
+	else
+		IPV6_ENABLED=0
+		IPV6_LISTEN_PREFIX='# '
+	fi
+}
+
+require_root() {
+	if [ "$(id -u)" -ne 0 ]; then
+		log_error "This script must be run as root. Re-run it with sudo or from a root shell."
+		exit 1
+	fi
+}
+
+command_exists() {
+	command -v "$1" > /dev/null 2>&1
+}
+
+reset_internal_state() {
+	unset CURRENT_TMP TRANSACTION_ACTIVE ROLLBACK_DONE BACKUP_DIR MANIFEST \
+		PORT_CHECKER MODE DOMAIN CERT_FILE KEY_FILE HTTP_PORT HTTPS_PORT \
+		TLS_INTERNAL_PORT BACKEND_PORT TLS_PASSTHROUGH SITE_CONFIG STREAM_CONFIG \
+		HTTP_REDIRECT_CONFIG REDIRECT_SNIPPET LOCATION_FRAGMENT WS_MAP_VAR \
+		PROMPTED_FILE PROMPTED_PORT SELECTED_FREE_PORT IPV6_ENABLED \
+		IPV6_LISTEN_PREFIX STATE_FILE MANAGED_EXISTING MANAGED_INSTALLED_AT \
+		MANAGED_LAST_CONFIGURED_AT
+}
+
+initialize_runtime_paths() {
+	NGINX_CONF_DIR=${NGINX_CONF_DIR:-/etc/nginx}
+	NGINX_MAIN_CONF=${NGINX_MAIN_CONF:-"$NGINX_CONF_DIR/nginx.conf"}
+	NGINX_BIN=${NGINX_BIN:-nginx}
+	STATE_FILE=${NGINX_RPM_STATE_FILE:-"$NGINX_CONF_DIR/.nginx-manager.conf"}
+
+	if ! validate_absolute_path "$NGINX_CONF_DIR"; then
+		fatal "NGINX_CONF_DIR must be an absolute path without spaces or Nginx control characters."
+	fi
+
+	if ! validate_absolute_path "$NGINX_MAIN_CONF"; then
+		fatal "NGINX_MAIN_CONF must be an absolute path without spaces or Nginx control characters."
+	fi
+
+	if ! validate_absolute_path "$STATE_FILE"; then
+		fatal "NGINX_RPM_STATE_FILE must be an absolute path without spaces or Nginx control characters."
+	fi
+}
+
+load_management_state() {
+	[ -f "$STATE_FILE" ] || return 1
+	[ -r "$STATE_FILE" ] || {
+		log_warn "The management state file is unreadable: $STATE_FILE"
+		return 1
+	}
+
+	lms_manager_id=
+	lms_version=
+	lms_installed_by_script=
+	lms_configured_by_script=
+	lms_ipv6=
+	lms_conf_dir=
+	lms_main_conf=
+	lms_installed_at=
+	lms_last_configured_at=
+
+	while IFS='=' read -r lms_key lms_value; do
+		case $lms_key in
+			MANAGER_ID) lms_manager_id=$lms_value ;;
+			STATE_VERSION) lms_version=$lms_value ;;
+			INSTALLED_BY_SCRIPT) lms_installed_by_script=$lms_value ;;
+			CONFIGURED_BY_SCRIPT) lms_configured_by_script=$lms_value ;;
+			IPV6_ENABLED) lms_ipv6=$lms_value ;;
+			NGINX_CONF_DIR) lms_conf_dir=$lms_value ;;
+			NGINX_MAIN_CONF) lms_main_conf=$lms_value ;;
+			INSTALLED_AT) lms_installed_at=$lms_value ;;
+			LAST_CONFIGURED_AT) lms_last_configured_at=$lms_value ;;
+		esac
+	done < "$STATE_FILE"
+
+	if [ "$lms_manager_id" != nginx-manager ] \
+		|| [ "$lms_version" != 1 ] \
+		|| [ "$lms_installed_by_script" != 1 ] \
+		|| [ "$lms_configured_by_script" != 1 ] \
+		|| [ "$lms_conf_dir" != "$NGINX_CONF_DIR" ] \
+		|| [ "$lms_main_conf" != "$NGINX_MAIN_CONF" ]; then
+		log_warn "Ignoring invalid or incompatible management state: $STATE_FILE"
+		unset lms_manager_id lms_version lms_installed_by_script \
+			lms_configured_by_script lms_ipv6 \
+			lms_conf_dir lms_main_conf lms_installed_at \
+			lms_last_configured_at lms_key lms_value
+		return 1
+	fi
+
+	case $lms_ipv6 in
+		1)
+			IPV6_ENABLED=1
+			IPV6_LISTEN_PREFIX=
+			;;
+		0)
+			IPV6_ENABLED=0
+			IPV6_LISTEN_PREFIX='# '
+			;;
+		*)
+			log_warn "Ignoring management state with an invalid IPv6 setting: $STATE_FILE"
+			unset lms_manager_id lms_version lms_installed_by_script \
+				lms_configured_by_script lms_ipv6 \
+				lms_conf_dir lms_main_conf lms_installed_at \
+				lms_last_configured_at lms_key lms_value
+			return 1
+			;;
+	esac
+
+	MANAGED_EXISTING=1
+	MANAGED_INSTALLED_AT=$lms_installed_at
+	MANAGED_LAST_CONFIGURED_AT=$lms_last_configured_at
+
+	unset lms_manager_id lms_version lms_installed_by_script \
+		lms_configured_by_script lms_ipv6 \
+		lms_conf_dir lms_main_conf lms_installed_at \
+		lms_last_configured_at lms_key lms_value
+	return 0
+}
+
+write_management_state() {
+	if [ -z "${MANAGED_INSTALLED_AT:-}" ]; then
+		MANAGED_INSTALLED_AT=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+	fi
+	MANAGED_LAST_CONFIGURED_AT=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+
+	make_temp_for "$STATE_FILE"
+
+	cat > "$CURRENT_TMP" <<- MANAGEMENT_STATE
+		MANAGER_ID=nginx-manager
+		STATE_VERSION=1
+		INSTALLED_BY_SCRIPT=1
+		CONFIGURED_BY_SCRIPT=1
+		IPV6_ENABLED=$IPV6_ENABLED
+		NGINX_CONF_DIR=$NGINX_CONF_DIR
+		NGINX_MAIN_CONF=$NGINX_MAIN_CONF
+		INSTALLED_AT=$MANAGED_INSTALLED_AT
+		LAST_CONFIGURED_AT=$MANAGED_LAST_CONFIGURED_AT
+	MANAGEMENT_STATE
+
+	chmod 0600 "$CURRENT_TMP" \
+		|| fatal "Could not secure the management state temporary file."
+
+	if [ -e "$STATE_FILE" ] || [ -L "$STATE_FILE" ]; then
+		wms_backup=$(backup_name_for "$STATE_FILE")
+		cp -p -P "$STATE_FILE" "$wms_backup" \
+			|| fatal "Could not back up the existing management state."
+		record_change O "$STATE_FILE" "$wms_backup"
+		unset wms_backup
+	else
+		record_change N "$STATE_FILE" ""
+	fi
+
+	mv -f "$CURRENT_TMP" "$STATE_FILE" \
+		|| fatal "Could not atomically install the management state file."
+	unset CURRENT_TMP
+	log_success "Updated management state: $STATE_FILE"
+}
+
+select_port_checker() {
+	if command_exists ss; then
+		PORT_CHECKER=ss
+	elif command_exists netstat; then
+		PORT_CHECKER=netstat
+	else
+		fatal "Neither ss nor netstat is available for checking listener ports."
+	fi
+}
+
+validate_existing_managed_runtime() {
+	command_exists "$NGINX_BIN" \
+		|| fatal "The managed Nginx executable is unavailable: $NGINX_BIN"
+	[ -f "$NGINX_MAIN_CONF" ] \
+		|| fatal "The managed Nginx configuration is missing: $NGINX_MAIN_CONF"
+	command_exists cksum \
+		|| fatal "The POSIX cksum utility is required but was not found."
+	select_port_checker
+}
+
+ensure_managed_support_files() {
+	ems_snippet="$NGINX_CONF_DIR/snippets/redirect_443.forcessl.conf"
+	if [ ! -f "$ems_snippet" ]; then
+		log_warn "The managed HTTPS redirect snippet is missing; recreating it."
+		write_redirect_snippet
+	fi
+	unset ems_snippet
+}
+
+managed_conf_files() {
+	for mcf_file in \
+		"$NGINX_CONF_DIR/conf.d"/redirect_*.conf \
+		"$NGINX_CONF_DIR/conf.d"/reverse_proxy_*.conf \
+		"$NGINX_CONF_DIR/conf.d"/custom_proxy_*.conf \
+		"$NGINX_CONF_DIR/stream-conf.d"/redirect_*.conf; do
+		[ -f "$mcf_file" ] || continue
+		if grep '^[[:space:]]*# Managed' "$mcf_file" > /dev/null 2>&1; then
+			printf '%s\n' "$mcf_file"
+		fi
+	done
+	unset mcf_file
+}
+
+port_owned_by_nginx() {
+	mpobn_port=$1
+
+	case ${PORT_CHECKER:-} in
+		ss)
+			ss -ltnp 2> /dev/null | awk -v wanted="$mpobn_port" '
+				NR > 1 {
+					address = $4
+					sub(/^.*:/, "", address)
+					if (address == wanted && $0 ~ /nginx/) {
+						found = 1
+					}
+				}
+				END { exit(found ? 0 : 1) }
+			'
+			mpobn_status=$?
+			;;
+		netstat)
+			netstat -ltnp 2> /dev/null | awk -v wanted="$mpobn_port" '
+				NR > 2 {
+					address = $4
+					sub(/^.*:/, "", address)
+					if (address == wanted && $0 ~ /nginx/) {
+						found = 1
+					}
+				}
+				END { exit(found ? 0 : 1) }
+			'
+			mpobn_status=$?
+			;;
+		*)
+			mpobn_status=1
+			;;
+	esac
+
+	unset mpobn_port
+	if [ "$mpobn_status" -eq 0 ]; then
+		unset mpobn_status
+		return 0
+	fi
+	unset mpobn_status
+	return 1
+}
+
+managed_listener_status() {
+	mls_spec=$1
+	mls_endpoint=${mls_spec%% *}
+
+	case $mls_endpoint in
+		\[*\]:*) mls_port=${mls_endpoint##*:} ;;
+		*:*) mls_port=${mls_endpoint##*:} ;;
+		*) mls_port=$mls_endpoint ;;
+	esac
+
+	case $mls_port in
+		'' | *[!0-9]*)
+			printf '%s\n' CONFIGURED
+			;;
+		*)
+			if port_owned_by_nginx "$mls_port"; then
+				printf '%s\n' ACTIVE
+			elif port_in_use "$mls_port"; then
+				printf '%s\n' OTHER
+			else
+				printf '%s\n' INACTIVE
+			fi
+			;;
+	esac
+
+	unset mls_spec mls_endpoint mls_port
+}
+
+build_listener_inventory() {
+	bmli_output=$1
+	: > "$bmli_output" || fatal "Could not create the managed-listener inventory."
+
+	if ! managed_conf_files | while IFS= read -r bmli_file; do
+		awk -v source="$bmli_file" '
+			function trim(value) {
+				sub(/^[[:space:]]+/, "", value)
+				sub(/[[:space:]]+$/, "", value)
+				return value
+			}
+			BEGIN {
+				in_server = 0
+				depth = 0
+				listen_count = 0
+				server_name = ""
+			}
+			{
+				line = $0
+				if (!in_server && line ~ /^[[:space:]]*server[[:space:]]*\{/) {
+					in_server = 1
+					depth = 0
+					listen_count = 0
+					server_name = ""
+				}
+
+				if (in_server) {
+					if (line ~ /^[[:space:]]*listen[[:space:]]+/) {
+						value = line
+						sub(/^[[:space:]]*listen[[:space:]]+/, "", value)
+						sub(/;[[:space:]]*$/, "", value)
+						listens[++listen_count] = trim(value)
+					}
+
+					if (line ~ /^[[:space:]]*server_name[[:space:]]+/) {
+						value = line
+						sub(/^[[:space:]]*server_name[[:space:]]+/, "", value)
+						sub(/;[[:space:]]*$/, "", value)
+						server_name = trim(value)
+					}
+
+					opening = line
+					closing = line
+					open_count = gsub(/\{/, "", opening)
+					close_count = gsub(/\}/, "", closing)
+					depth += open_count - close_count
+
+					if (depth == 0) {
+						if (server_name == "") {
+							server_name = "stream/SNI gateway"
+						}
+						for (listener_index = 1; listener_index <= listen_count; listener_index++) {
+							print source "|" listens[listener_index] "|" server_name
+							delete listens[listener_index]
+						}
+						in_server = 0
+					}
+				}
+			}
+		' "$bmli_file" >> "$bmli_output" || exit 1
+	done; then
+		fatal "Could not parse the managed-listener inventory."
+	fi
+
+	unset bmli_output bmli_file
+}
+
+build_upstream_inventory() {
+	bmui_output=$1
+	: > "$bmui_output" || fatal "Could not create the managed-upstream inventory."
+
+	if ! managed_conf_files | while IFS= read -r bmui_file; do
+		awk -v source="$bmui_file" '
+			BEGIN {
+				in_upstream = 0
+				depth = 0
+				upstream_name = ""
+			}
+			{
+				line = $0
+				if (!in_upstream && line ~ /^[[:space:]]*upstream[[:space:]]+[A-Za-z0-9_]+[[:space:]]*\{/) {
+					value = line
+					sub(/^[[:space:]]*upstream[[:space:]]+/, "", value)
+					sub(/[[:space:]]*\{.*$/, "", value)
+					upstream_name = value
+					in_upstream = 1
+					depth = 0
+				}
+
+				if (in_upstream) {
+					if (line ~ /^[[:space:]]*server[[:space:]]+/) {
+						value = line
+						sub(/^[[:space:]]*server[[:space:]]+/, "", value)
+						sub(/;[[:space:]]*$/, "", value)
+						print source "|" upstream_name "|" value
+					}
+
+					opening = line
+					closing = line
+					open_count = gsub(/\{/, "", opening)
+					close_count = gsub(/\}/, "", closing)
+					depth += open_count - close_count
+					if (depth == 0) {
+						in_upstream = 0
+					}
+				}
+			}
+		' "$bmui_file" >> "$bmui_output" || exit 1
+	done; then
+		fatal "Could not parse the managed-upstream inventory."
+	fi
+
+	unset bmui_output bmui_file
+}
+
+display_inventory() {
+	dmi_listeners="$BACKUP_DIR/managed-listeners.txt"
+	dmi_upstreams="$BACKUP_DIR/managed-upstreams.txt"
+	build_listener_inventory "$dmi_listeners"
+	build_upstream_inventory "$dmi_upstreams"
+
+	printf '\n\033[1mScript-managed Nginx listeners and servers\033[0m\n'
+
+	if [ -s "$dmi_listeners" ]; then
+		printf '%-9s %-34s %-30s %s\n' STATUS LISTEN SERVER CONFIGURATION
+		printf '%-9s %-34s %-30s %s\n' '---------' '----------------------------------' '------------------------------' '-------------'
+		while IFS='|' read -r dmi_file dmi_listen dmi_server; do
+			dmi_status=$(managed_listener_status "$dmi_listen")
+			printf '%-9s %-34s %-30s %s\n' \
+				"$dmi_status" "$dmi_listen" "$dmi_server" "$dmi_file"
+		done < "$dmi_listeners"
+		unset dmi_file dmi_listen dmi_server dmi_status
+	else
+		printf 'No active script-managed listener configurations were found.\n'
+	fi
+
+	if [ -s "$dmi_upstreams" ]; then
+		printf '\n%-34s %-38s %s\n' UPSTREAM SERVER CONFIGURATION
+		printf '%-34s %-38s %s\n' '----------------------------------' '--------------------------------------' '-------------'
+		while IFS='|' read -r dmi_file dmi_upstream dmi_target; do
+			printf '%-34s %-38s %s\n' \
+				"$dmi_upstream" "$dmi_target" "$dmi_file"
+		done < "$dmi_upstreams"
+		unset dmi_file dmi_upstream dmi_target
+	fi
+
+	printf '\n'
+	unset dmi_listeners dmi_upstreams
+}
+
+make_temp_for() {
+	ct_target=$1
+	ct_dir=$(dirname "$ct_target")
+	ct_base=$(basename "$ct_target")
+	ct_attempt=0
+
+	cleanup_temp
+
+	while [ "$ct_attempt" -lt 100 ]; do
+		ct_candidate="${ct_dir}/.${ct_base}.tmp.$$.$ct_attempt"
+		if (
+			umask 077
+			set -C
+			: > "$ct_candidate"
+		) 2> /dev/null; then
+			CURRENT_TMP=$ct_candidate
+			unset ct_target ct_dir ct_base ct_attempt ct_candidate
+			return 0
+		fi
+		ct_attempt=$((ct_attempt + 1))
+	done
+
+	unset ct_dir ct_base ct_attempt ct_candidate
+	fatal "Could not create a safe temporary file beside $ct_target."
+}
+
+record_change() {
+	rc_type=$1
+	rc_target=$2
+	rc_backup=${3:-}
+
+	printf '%s|%s|%s\n' "$rc_type" "$rc_target" "$rc_backup" >> "$MANIFEST" \
+		|| fatal "Could not update the transaction manifest."
+
+	unset rc_type rc_target rc_backup
+}
+
+backup_name_for() {
+	bnf_target=$1
+	bnf_stripped=$(printf '%s' "$bnf_target" | sed 's#^/##; s#/#__#g')
+	printf '%s/%s\n' "$BACKUP_DIR" "$bnf_stripped"
+	unset bnf_target bnf_stripped
+}
+
+prepare_for_replace() {
+	ptr_target=$1
+
+	if [ -e "$ptr_target" ] || [ -L "$ptr_target" ]; then
+		log_warn "The file already exists: $ptr_target"
+		if ! confirm "Overwrite this file?" no; then
+			fatal "Stopped without overwriting $ptr_target."
+		fi
+
+		if confirm "Create a rollback backup first?" yes; then
+			ptr_backup=$(backup_name_for "$ptr_target")
+			if ! cp -p -P "$ptr_target" "$ptr_backup"; then
+				fatal "Could not back up $ptr_target to $ptr_backup."
+			fi
+			record_change O "$ptr_target" "$ptr_backup"
+			log_success "Backup created: $ptr_backup"
+			unset ptr_backup
+		else
+			log_warn "No backup will be available for $ptr_target."
+			if ! confirm "Continue without a backup?" no; then
+				fatal "Stopped before overwriting $ptr_target."
+			fi
+			record_change X "$ptr_target" ""
+		fi
+	else
+		record_change N "$ptr_target" ""
+	fi
+
+	unset ptr_target
+}
+
+commit_temp_file() {
+	ctf_target=$1
+	ctf_mode=$2
+
+	[ -n "${CURRENT_TMP:-}" ] \
+		|| fatal "Internal error: no temporary file is ready for $ctf_target."
+
+	if ! chmod "$ctf_mode" "$CURRENT_TMP"; then
+		fatal "Could not set permissions on the temporary file for $ctf_target."
+	fi
+
+	prepare_for_replace "$ctf_target"
+
+	if ! mv -f "$CURRENT_TMP" "$ctf_target"; then
+		fatal "Could not atomically install $ctf_target."
+	fi
+
+	unset CURRENT_TMP
+	log_success "Installed: $ctf_target"
+	unset ctf_target ctf_mode
+}
+
+rollback_transaction() {
+	[ "${TRANSACTION_ACTIVE:-0}" -eq 1 ] || return 0
+	[ "${ROLLBACK_DONE:-0}" -eq 0 ] || return 0
+
+	ROLLBACK_DONE=1
+	log_warn "Rolling back managed configuration changes..."
+
+	if [ -f "${MANIFEST:-}" ]; then
+		while IFS='|' read -r rb_type rb_target rb_backup; do
+			case $rb_type in
+				O)
+					if [ -e "$rb_backup" ] || [ -L "$rb_backup" ]; then
+						rm -f "$rb_target" 2> /dev/null || :
+						if cp -p -P "$rb_backup" "$rb_target"; then
+							log_warn "Restored: $rb_target"
+						else
+							log_error "Failed to restore: $rb_target"
+						fi
+					fi
+					;;
+				N)
+					if rm -f "$rb_target" 2> /dev/null; then
+						log_warn "Removed newly created file: $rb_target"
+					else
+						log_error "Failed to remove new file: $rb_target"
+					fi
+					;;
+				M)
+					if [ -e "$rb_backup" ] || [ -L "$rb_backup" ]; then
+						rm -f "$rb_target" 2> /dev/null || :
+						if mv "$rb_backup" "$rb_target"; then
+							log_warn "Restored moved item: $rb_target"
+						else
+							log_error "Failed to restore moved item: $rb_target"
+						fi
+					fi
+					;;
+				X)
+					log_error "Cannot automatically restore unbacked file: $rb_target"
+					;;
+			esac
+		done < "$MANIFEST"
+		unset rb_type rb_target rb_backup
+	fi
+
+	TRANSACTION_ACTIVE=0
+}
+
+handle_signal() {
+	printf '\n' >&2
+	log_error "Interrupted."
+	cleanup_temp
+	rollback_transaction
+	exit 130
+}
+
+trap 'handle_signal' HUP INT TERM
+
+init_transaction() {
+	it_timestamp=$(date '+%Y%m%d-%H%M%S')
+	BACKUP_DIR="$NGINX_CONF_DIR/backups/reverse-proxy-$it_timestamp"
+	MANIFEST="$BACKUP_DIR/manifest.txt"
+	unset it_timestamp
+
+	run_or_die "Creating transaction backup directory" mkdir -p "$BACKUP_DIR"
+	run_or_die "Securing transaction backup directory" chmod 0700 "$BACKUP_DIR"
+	: > "$MANIFEST" || fatal "Could not create $MANIFEST."
+	chmod 0600 "$MANIFEST" || fatal "Could not secure $MANIFEST."
+
+	ROLLBACK_DONE=0
+	TRANSACTION_ACTIVE=1
+}
+
+remove_default_site() {
+	rds_default="$NGINX_CONF_DIR/sites-enabled/default"
+
+	if [ ! -e "$rds_default" ] && [ ! -L "$rds_default" ]; then
+		log_info "The default enabled site is already absent."
+		unset rds_default
+		return 0
+	fi
+
+	log_warn "Nginx's default enabled site exists: $rds_default"
+	if ! confirm "Disable it by moving it into the transaction backup directory?" yes; then
+		rm -f "$rds_default" 2> /dev/null || :
+		unset rds_default
+		return 0
+	fi
+
+	rds_backup="$BACKUP_DIR/sites-enabled-default"
+	if ! mv "$rds_default" "$rds_backup"; then
+		fatal "Could not disable the default Nginx site."
+	fi
+
+	record_change M "$rds_default" "$rds_backup"
+	log_success "Default site disabled and preserved at $rds_backup"
+	unset rds_default rds_backup
+}
+
+ensure_directories() {
+	for ed_directory in \
+		"$NGINX_CONF_DIR/conf.d" \
+		"$NGINX_CONF_DIR/snippets" \
+		"$NGINX_CONF_DIR/stream-conf.d" \
+		"$NGINX_CONF_DIR/backups"; do
+		if [ ! -d "$ed_directory" ]; then
+			run_or_die "Creating $ed_directory" mkdir -p "$ed_directory"
+		fi
+		run_or_die "Setting permissions on $ed_directory" chmod 0755 "$ed_directory"
+	done
+	unset ed_directory
+}
+
+install_packages() {
+	command_exists apt \
+		|| fatal "The apt command was not found. This script supports Debian/Ubuntu systems."
+
+	run_or_die "Updating APT package indexes" apt update
+	run_or_die "Installing Nginx and the stream module" \
+		apt install -y nginx libnginx-mod-stream
+
+	if ! command_exists ss && ! command_exists netstat; then
+		log_warn "Neither ss nor netstat is installed; installing iproute2 to provide ss."
+		run_or_die "Installing iproute2" apt install -y iproute2
+	fi
+
+	select_port_checker
+
+	command_exists cksum \
+		|| fatal "The POSIX cksum utility is required but was not found."
+}
+
+write_forced_ssl_snippet() {
+	wfss_https_port=$1
+	wfss_target="$NGINX_CONF_DIR/snippets/redirect_${wfss_https_port}.forcessl.conf"
+	make_temp_for "$wfss_target"
+
+	if [ "$wfss_https_port" -eq 443 ]; then
+		cat > "$CURRENT_TMP" <<- SNIPPET
+			# Managed reusable HTTP-to-HTTPS redirect for public domain listeners.
+			# Include only from an HTTP server block with a strict server_name.
+			return 301 https://\$host\$request_uri;
+		SNIPPET
+	else
+		cat > "$CURRENT_TMP" <<- SNIPPET
+			# Managed reusable HTTP-to-HTTPS redirect for custom port $wfss_https_port.
+			# Include only from an HTTP server block with a strict server_name.
+			return 301 https://\$host:$wfss_https_port\$request_uri;
+		SNIPPET
+	fi
+
+	commit_temp_file "$wfss_target" 0644
+	REDIRECT_SNIPPET=$wfss_target
+	unset wfss_https_port wfss_target
+}
+
+write_redirect_snippet() {
+	write_forced_ssl_snippet 443
+	unset REDIRECT_SNIPPET
+}
+
+write_redirect_80() {
+	wbr_target="$NGINX_CONF_DIR/conf.d/redirect_80.conf"
+	make_temp_for "$wbr_target"
+
+	cat > "$CURRENT_TMP" <<- REDIRECT_80
+		# Managed public HTTP catch-all.
+		# Unknown Host headers are closed without returning content.
+		server {
+		    listen 80 default_server;
+		    ${IPV6_LISTEN_PREFIX}listen [::]:80 default_server;
+		    server_name _;
+
+		    server_tokens off;
+		    return 444;
+		}
+	REDIRECT_80
+
+	commit_temp_file "$wbr_target" 0644
+	unset wbr_target
+}
+
+validate_domain() {
+	vd_candidate=$1
+
+	[ -n "$vd_candidate" ] || {
+		unset vd_candidate
+		return 1
+	}
+	[ "${#vd_candidate}" -le 253 ] || {
+		unset vd_candidate
+		return 1
+	}
+
+	case $vd_candidate in
+		*[!A-Za-z0-9.-]* | .* | *. | *..*)
+			unset vd_candidate
+			return 1
+			;;
+		*.*) ;;
+		*)
+			unset vd_candidate
+			return 1
+			;;
+	esac
+
+	vd_old_ifs=$IFS
+	IFS='.'
+	set -- $vd_candidate
+	IFS=$vd_old_ifs
+
+	for vd_label; do
+		[ -n "$vd_label" ] || {
+			unset vd_candidate vd_old_ifs vd_label
+			return 1
+		}
+		[ "${#vd_label}" -le 63 ] || {
+			unset vd_candidate vd_old_ifs vd_label
+			return 1
+		}
+		case $vd_label in
+			-* | *-)
+				unset vd_candidate vd_old_ifs vd_label
+				return 1
+				;;
+		esac
+	done
+
+	unset vd_candidate vd_old_ifs vd_label
+	return 0
+}
+
+validate_hostname() {
+	vh_candidate=$1
+
+	[ -n "$vh_candidate" ] || {
+		unset vh_candidate
+		return 1
+	}
+	[ "${#vh_candidate}" -le 253 ] || {
+		unset vh_candidate
+		return 1
+	}
+
+	case $vh_candidate in
+		*[!A-Za-z0-9.-]* | .* | *. | *..*)
+			unset vh_candidate
+			return 1
+			;;
+	esac
+
+	vh_old_ifs=$IFS
+	IFS='.'
+	set -- $vh_candidate
+	IFS=$vh_old_ifs
+
+	for vh_label; do
+		[ -n "$vh_label" ] || {
+			unset vh_candidate vh_old_ifs vh_label
+			return 1
+		}
+		[ "${#vh_label}" -le 63 ] || {
+			unset vh_candidate vh_old_ifs vh_label
+			return 1
+		}
+		case $vh_label in
+			-* | *-)
+				unset vh_candidate vh_old_ifs vh_label
+				return 1
+				;;
+		esac
+	done
+
+	unset vh_candidate vh_old_ifs vh_label
+	return 0
+}
+
+validate_upstream_hostname() {
+	vuh_candidate=$1
+
+	[ -n "$vuh_candidate" ] || {
+		unset vuh_candidate
+		return 1
+	}
+	[ "${#vuh_candidate}" -le 253 ] || {
+		unset vuh_candidate
+		return 1
+	}
+
+	case $vuh_candidate in
+		*[!A-Za-z0-9._-]* | .* | *. | *..*)
+			unset vuh_candidate
+			return 1
+			;;
+	esac
+
+	vuh_old_ifs=$IFS
+	IFS='.'
+	set -- $vuh_candidate
+	IFS=$vuh_old_ifs
+
+	for vuh_label; do
+		[ -n "$vuh_label" ] || {
+			unset vuh_candidate vuh_old_ifs vuh_label
+			return 1
+		}
+		[ "${#vuh_label}" -le 63 ] || {
+			unset vuh_candidate vuh_old_ifs vuh_label
+			return 1
+		}
+		case $vuh_label in
+			-* | *-)
+				unset vuh_candidate vuh_old_ifs vuh_label
+				return 1
+				;;
+		esac
+	done
+
+	unset vuh_candidate vuh_old_ifs vuh_label
+	return 0
+}
+
+validate_ipv4() {
+	vi_candidate=$1
+	vi_old_ifs=$IFS
+	IFS='.'
+	set -- $vi_candidate
+	IFS=$vi_old_ifs
+
+	[ "$#" -eq 4 ] || {
+		unset vi_candidate vi_old_ifs
+		return 1
+	}
+
+	for vi_octet; do
+		case $vi_octet in
+			'' | *[!0-9]*)
+				unset vi_candidate vi_old_ifs vi_octet
+				return 1
+				;;
+		esac
+		[ "$vi_octet" -le 255 ] 2> /dev/null || {
+			unset vi_candidate vi_old_ifs vi_octet
+			return 1
+		}
+	done
+
+	unset vi_candidate vi_old_ifs vi_octet
+	return 0
+}
+
+validate_ipv6() {
+	v6_candidate=$1
+
+	awk -v address="$v6_candidate" '
+		function valid_ipv4(value, parts, count, i) {
+			count = split(value, parts, ".")
+			if (count != 4) {
+				return 0
+			}
+			for (i = 1; i <= 4; i++) {
+				if (parts[i] !~ /^[0-9]+$/ ||
+					parts[i] + 0 < 0 || parts[i] + 0 > 255) {
+					return 0
+				}
+			}
+			return 1
+		}
+		BEGIN {
+			if (address !~ /^[0-9A-Fa-f:.]+$/ || index(address, ":") == 0 ||
+				index(address, ":::") != 0) {
+				exit 1
+			}
+
+			copy = address
+			compressed = 0
+			while ((position = index(copy, "::")) != 0) {
+				compressed++
+				copy = substr(copy, position + 2)
+			}
+			if (compressed > 1) {
+				exit 1
+			}
+
+			if (substr(address, 1, 1) == ":" &&
+				substr(address, 1, 2) != "::") {
+				exit 1
+			}
+			if (substr(address, length(address), 1) == ":" &&
+				substr(address, length(address) - 1, 2) != "::") {
+				exit 1
+			}
+
+			count = split(address, groups, ":")
+			logical_groups = 0
+
+			for (i = 1; i <= count; i++) {
+				if (groups[i] == "") {
+					continue
+				}
+
+				if (index(groups[i], ".") != 0) {
+					if (i != count || !valid_ipv4(groups[i])) {
+						exit 1
+					}
+					logical_groups += 2
+					continue
+				}
+
+				if (groups[i] !~ /^[0-9A-Fa-f]{1,4}$/) {
+					exit 1
+				}
+				logical_groups++
+			}
+
+			if (compressed == 1) {
+				exit(logical_groups < 8 ? 0 : 1)
+			}
+			exit(logical_groups == 8 ? 0 : 1)
+		}
+	'
+	v6_status=$?
+	unset v6_candidate
+
+	if [ "$v6_status" -eq 0 ]; then
+		unset v6_status
+		return 0
+	fi
+
+	unset v6_status
+	return 1
+}
+
+validate_proxy_host() {
+	vph_candidate=$1
+
+	case $vph_candidate in
+		*[!0-9.]*)
+			if validate_upstream_hostname "$vph_candidate"; then
+				unset vph_candidate
+				return 0
+			fi
+			;;
+		*)
+			if validate_ipv4 "$vph_candidate"; then
+				unset vph_candidate
+				return 0
+			fi
+			;;
+	esac
+
+	unset vph_candidate
+	return 1
+}
+
+prompt_domain() {
+	pd_prompt=$1
+
+	while :; do
+		printf '%s: ' "$pd_prompt"
+		if ! IFS= read -r pd_input; then
+			fatal "Input ended before a domain was provided."
+		fi
+
+		pd_input=$(printf '%s' "$pd_input" \
+			| tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')
+
+		if validate_domain "$pd_input"; then
+			DOMAIN=$pd_input
+			unset pd_prompt pd_input
+			return 0
+		fi
+
+		log_warn "Invalid domain. Use a DNS name such as example.com: at least one dot, no spaces, labels containing only letters, digits, and hyphens, and no leading/trailing hyphens."
+	done
+}
+
+validate_absolute_path() {
+	vasp_candidate=$1
+
+	case $vasp_candidate in
+		/*) ;;
+		*)
+			unset vasp_candidate
+			return 1
+			;;
+	esac
+
+	case $vasp_candidate in
+		*[!A-Za-z0-9_./+,:=@%-]* | *//* | */../* | */..)
+			unset vasp_candidate
+			return 1
+			;;
+	esac
+
+	unset vasp_candidate
+	return 0
+}
+
+prompt_existing_file() {
+	pef_label=$1
+
+	while :; do
+		printf '%s: ' "$pef_label"
+		if ! IFS= read -r pef_candidate; then
+			fatal "Input ended before a file path was provided."
+		fi
+
+		if ! validate_absolute_path "$pef_candidate"; then
+			log_warn "Enter an absolute path using safe path characters and no spaces."
+			continue
+		fi
+
+		if [ ! -f "$pef_candidate" ]; then
+			log_warn "File not found: $pef_candidate"
+			continue
+		fi
+
+		if [ ! -r "$pef_candidate" ]; then
+			log_warn "File is not readable: $pef_candidate"
+			continue
+		fi
+
+		PROMPTED_FILE=$pef_candidate
+		unset pef_label pef_candidate
+		return 0
+	done
+}
+
+select_certificate_paths() {
+	scp_found=
+
+	for scp_pair in \
+		"$NGINX_CONF_DIR/../letsencrypt/live/$DOMAIN/fullchain.pem|$NGINX_CONF_DIR/../letsencrypt/live/$DOMAIN/privkey.pem" \
+		"$NGINX_CONF_DIR/certs/$DOMAIN.crt|$NGINX_CONF_DIR/certs/$DOMAIN.key" \
+		"$NGINX_CONF_DIR/certs/$DOMAIN.cer|$NGINX_CONF_DIR/certs/$DOMAIN.key" \
+		"/etc/ssl/$DOMAIN/$DOMAIN.crt|/etc/ssl/$DOMAIN/$DOMAIN.key"; do
+		scp_cert=${scp_pair%%|*}
+		scp_key=${scp_pair#*|}
+
+		if [ -f "$scp_cert" ] && [ -r "$scp_cert" ] \
+			&& [ -f "$scp_key" ] && [ -r "$scp_key" ]; then
+			scp_found=$scp_pair
+			break
+		fi
+	done
+
+	if [ -n "$scp_found" ]; then
+		scp_cert=${scp_found%%|*}
+		scp_key=${scp_found#*|}
+		log_success "Detected certificate: $scp_cert"
+		log_success "Detected private key: $scp_key"
+
+		if confirm "Use these detected certificate files?" yes; then
+			CERT_FILE=$scp_cert
+			KEY_FILE=$scp_key
+			unset scp_found scp_pair scp_cert scp_key
+			return 0
+		fi
+	else
+		log_warn "No complete certificate/key pair was auto-detected for $DOMAIN."
+	fi
+
+	prompt_existing_file "Enter the full SSL certificate/full-chain path"
+	CERT_FILE=$PROMPTED_FILE
+	unset PROMPTED_FILE
+
+	prompt_existing_file "Enter the full SSL private-key path"
+	KEY_FILE=$PROMPTED_FILE
+	unset PROMPTED_FILE
+
+	[ "$CERT_FILE" != "$KEY_FILE" ] \
+		|| fatal "The certificate and private key paths must be different files."
+
+	unset scp_found scp_pair scp_cert scp_key
+}
+
+validate_certificate_pair() {
+	if ! command_exists openssl; then
+		log_warn "OpenSSL is unavailable; certificate structure and key matching will be checked later by nginx -t."
+		return 0
+	fi
+
+	if ! openssl x509 -in "$CERT_FILE" -noout > /dev/null 2>&1; then
+		fatal "The selected certificate is not a readable X.509 certificate: $CERT_FILE"
+	fi
+
+	vcp_cert_public="$BACKUP_DIR/certificate-public-key.pem"
+	vcp_key_public="$BACKUP_DIR/private-key-public-key.pem"
+
+	if ! openssl x509 -in "$CERT_FILE" -pubkey -noout 2> /dev/null \
+		| openssl pkey -pubin -outform PEM > "$vcp_cert_public" 2> /dev/null; then
+		fatal "Could not extract the public key from $CERT_FILE."
+	fi
+
+	if ! openssl pkey -in "$KEY_FILE" -pubout -outform PEM -passin pass: \
+		> "$vcp_key_public" 2> /dev/null; then
+		fatal "The private key is invalid, unreadable, or encrypted: $KEY_FILE"
+	fi
+
+	if ! cmp "$vcp_cert_public" "$vcp_key_public" > /dev/null 2>&1; then
+		fatal "The certificate and private key do not match."
+	fi
+
+	rm -f "$vcp_cert_public" "$vcp_key_public"
+	unset vcp_cert_public vcp_key_public
+
+	if ! openssl x509 -in "$CERT_FILE" -checkend 604800 -noout > /dev/null 2>&1; then
+		log_warn "The selected certificate is expired or will expire within seven days."
+		if ! confirm "Continue with this certificate anyway?" no; then
+			fatal "Stopped because the certificate is expired or near expiry."
+		fi
+	fi
+
+	log_success "Certificate and private key validation passed."
+}
+
+validate_port() {
+	vp_candidate=$1
+
+	case $vp_candidate in
+		'' | *[!0-9]*)
+			unset vp_candidate
+			return 1
+			;;
+	esac
+
+	[ "$vp_candidate" -ge 1 ] 2> /dev/null || {
+		unset vp_candidate
+		return 1
+	}
+	[ "$vp_candidate" -le 65535 ] 2> /dev/null || {
+		unset vp_candidate
+		return 1
+	}
+
+	unset vp_candidate
+	return 0
+}
+
+port_in_use() {
+	piu_port=$1
+
+	case ${PORT_CHECKER:-} in
+		ss)
+			ss -ltn 2> /dev/null | awk -v wanted="$piu_port" '
+				NR > 1 {
+					address = $4
+					sub(/^.*:/, "", address)
+					if (address == wanted) {
+						found = 1
+					}
+				}
+				END { exit(found ? 0 : 1) }
+			'
+			piu_status=$?
+			;;
+		netstat)
+			netstat -ltn 2> /dev/null | awk -v wanted="$piu_port" '
+				NR > 2 {
+					address = $4
+					sub(/^.*:/, "", address)
+					if (address == wanted) {
+						found = 1
+					}
+				}
+				END { exit(found ? 0 : 1) }
+			'
+			piu_status=$?
+			;;
+		*)
+			unset piu_port
+			fatal "No listener-port checker is configured."
+			;;
+	esac
+
+	unset piu_port
+	if [ "$piu_status" -eq 0 ]; then
+		unset piu_status
+		return 0
+	fi
+
+	unset piu_status
+	return 1
+}
+
+prompt_port() {
+	pp_label=$1
+	pp_default=$2
+
+	while :; do
+		printf '%s [%s]: ' "$pp_label" "$pp_default"
+		if ! IFS= read -r pp_candidate; then
+			fatal "Input ended before a port was provided."
+		fi
+		[ -n "$pp_candidate" ] || pp_candidate=$pp_default
+
+		if ! validate_port "$pp_candidate"; then
+			log_warn "Enter a numeric TCP port from 1 through 65535."
+			continue
+		fi
+
+		if port_in_use "$pp_candidate"; then
+			log_warn "TCP port $pp_candidate currently has a listening socket."
+			if ! confirm "Continue only if this listener belongs to the Nginx configuration being replaced?" no; then
+				continue
+			fi
+		fi
+
+		PROMPTED_PORT=$pp_candidate
+		unset pp_label pp_default pp_candidate
+		return 0
+	done
+}
+
+random_u32() {
+	if [ -r /dev/urandom ] && command_exists od; then
+		ru_value=$(od -An -N4 -tu4 /dev/urandom 2> /dev/null \
+			| tr -d '[:space:]')
+		case $ru_value in
+			'' | *[!0-9]*)
+				ru_value=
+				;;
+		esac
+
+		if [ -n "$ru_value" ]; then
+			printf '%s\n' "$ru_value"
+			unset ru_value
+			return 0
+		fi
+		unset ru_value
+	fi
+
+	awk 'BEGIN { srand(); printf "%.0f\n", rand() * 4294967295 }'
+}
+
+find_random_port() {
+	frfp_minimum=$1
+	frfp_maximum=$2
+	frfp_span=$((frfp_maximum - frfp_minimum + 1))
+	frfp_attempt=0
+
+	while [ "$frfp_attempt" -lt 4096 ]; do
+		frfp_random=$(random_u32)
+		frfp_candidate=$((frfp_minimum + (frfp_random % frfp_span)))
+
+		if ! port_in_use "$frfp_candidate"; then
+			SELECTED_FREE_PORT=$frfp_candidate
+			unset frfp_minimum frfp_maximum frfp_span frfp_attempt \
+				frfp_random frfp_candidate
+			return 0
+		fi
+
+		frfp_attempt=$((frfp_attempt + 1))
+		unset frfp_random frfp_candidate
+	done
+
+	unset frfp_minimum frfp_maximum frfp_span frfp_attempt
+	fatal "Could not find a free TCP port in the requested range."
+}
+
+domain_checksum() {
+	dc_domain=$1
+	printf '%s\n' "$dc_domain" | cksum | awk '{print $1}'
+	unset dc_domain
+}
+
+bounded_domain_token() {
+	bdt_domain=$1
+	bdt_maximum=$2
+	bdt_safe=$(printf '%s' "$bdt_domain" | sed 's/[.-]/_/g')
+
+	if [ "${#bdt_safe}" -le "$bdt_maximum" ]; then
+		printf '%s\n' "$bdt_safe"
+		unset bdt_domain bdt_maximum bdt_safe
+		return 0
+	fi
+
+	bdt_checksum=$(domain_checksum "$bdt_domain")
+	bdt_prefix_length=$((bdt_maximum - ${#bdt_checksum} - 1))
+	[ "$bdt_prefix_length" -ge 1 ] \
+		|| fatal "Internal error: bounded identifier length is too small."
+
+	bdt_prefix=$(printf '%s' "$bdt_safe" | cut -c "1-$bdt_prefix_length")
+	printf '%s_%s\n' "$bdt_prefix" "$bdt_checksum"
+
+	unset bdt_domain bdt_maximum bdt_safe bdt_checksum \
+		bdt_prefix_length bdt_prefix
+}
+
+websocket_map_variable() {
+	wmv_domain=$1
+	wmv_checksum=$(domain_checksum "$wmv_domain")
+	printf 'map_%s\n' "$wmv_checksum"
+	unset wmv_domain wmv_checksum
+}
+
+stream_upstream_name() {
+	sun_domain=$1
+	sun_public_port=$2
+	sun_safe=$(printf '%s' "$sun_domain" | sed 's/[.-]/_/g')
+	sun_prefix=$(printf '%s' "$sun_safe" | cut -c '1-36')
+	sun_checksum=$(domain_checksum "$sun_domain")
+	printf 'sni_%s_%s_%s\n' "$sun_public_port" "$sun_prefix" "$sun_checksum"
+	unset sun_domain sun_public_port sun_safe sun_prefix sun_checksum
+}
+
+ensure_stream_include() {
+	[ -f "$NGINX_MAIN_CONF" ] \
+		|| fatal "$NGINX_MAIN_CONF does not exist after Nginx installation."
+
+	if grep '^[[:space:]]*include[[:space:]]*/.*stream-conf\.d/\*\.conf[[:space:]]*;' \
+		"$NGINX_MAIN_CONF" > /dev/null 2>&1; then
+		log_info "The stream configuration include is already present in nginx.conf."
+		return 0
+	fi
+
+	make_temp_for "$NGINX_MAIN_CONF"
+
+	awk -v include_path="$NGINX_CONF_DIR/stream-conf.d/*.conf" '
+		BEGIN {
+			inserted = 0
+			pending_stream = 0
+		}
+		{
+			line = $0
+
+			if (!inserted && line ~ /^[[:space:]]*stream[[:space:]]*\{/) {
+				if (line ~ /}[[:space:]]*$/) {
+					sub(/}[[:space:]]*$/,
+						"\n    include " include_path ";\n}", line)
+					print line
+				} else {
+					print line
+					print "    include " include_path ";"
+				}
+				inserted = 1
+				next
+			}
+
+			if (!inserted && line ~ /^[[:space:]]*stream[[:space:]]*$/) {
+				print line
+				pending_stream = 1
+				next
+			}
+
+			if (!inserted && pending_stream) {
+				print line
+				if (line ~ /^[[:space:]]*\{/) {
+					print "    include " include_path ";"
+					inserted = 1
+					pending_stream = 0
+				}
+				next
+			}
+
+			print line
+		}
+		END {
+			if (!inserted) {
+				print ""
+				print "# Managed SNI/TCP routing configuration."
+				print "stream {"
+				print "    include " include_path ";"
+				print "}"
+			}
+		}
+	' "$NGINX_MAIN_CONF" > "$CURRENT_TMP" \
+		|| fatal "Could not add the stream include to nginx.conf."
+
+	commit_temp_file "$NGINX_MAIN_CONF" 0644
+}
+
+write_domain_redirect_80() {
+	wdr_target="$NGINX_CONF_DIR/conf.d/redirect_80.conf"
+	make_temp_for "$wdr_target"
+
+	cat > "$CURRENT_TMP" <<- DOMAIN_REDIRECT_80
+		# Managed public HTTP catch-all.
+		# Unknown Host headers are closed without returning content.
+		server {
+		    listen 80 default_server;
+		    ${IPV6_LISTEN_PREFIX}listen [::]:80 default_server;
+		    server_name _;
+
+		    server_tokens off;
+		    return 444;
+		}
+
+		# Public HTTP redirect for $DOMAIN.
+		server {
+		    listen 80;
+		    ${IPV6_LISTEN_PREFIX}listen [::]:80;
+		    server_name $DOMAIN;
+
+		    server_tokens off;
+		    include $NGINX_CONF_DIR/snippets/redirect_443.forcessl.conf;
+		}
+	DOMAIN_REDIRECT_80
+
+	commit_temp_file "$wdr_target" 0644
+	HTTP_REDIRECT_CONFIG=$wdr_target
+	unset wdr_target
+}
+
+write_custom_redirect_config() {
+	wcrc_target="$NGINX_CONF_DIR/conf.d/redirect_${HTTP_PORT}.conf"
+	make_temp_for "$wcrc_target"
+
+	cat > "$CURRENT_TMP" <<- CUSTOM_REDIRECT
+		# Managed custom-port HTTP redirect for $DOMAIN.
+		# Unknown Host headers on port $HTTP_PORT are closed without content.
+		server {
+		    listen $HTTP_PORT default_server;
+		    ${IPV6_LISTEN_PREFIX}listen [::]:$HTTP_PORT default_server;
+		    server_name _;
+
+		    server_tokens off;
+		    return 444;
+		}
+
+		server {
+		    listen $HTTP_PORT;
+		    ${IPV6_LISTEN_PREFIX}listen [::]:$HTTP_PORT;
+		    server_name $DOMAIN;
+
+		    if (\$host != "$DOMAIN") {
+		        return 444;
+		    }
+
+		    server_tokens off;
+		    include $REDIRECT_SNIPPET;
+		}
+	CUSTOM_REDIRECT
+
+	commit_temp_file "$wcrc_target" 0644
+	HTTP_REDIRECT_CONFIG=$wcrc_target
+	unset wcrc_target
+}
+
+write_stream_sni_config() {
+	wssc_public_port=${1:-443}
+	wssc_target="$NGINX_CONF_DIR/stream-conf.d/redirect_${wssc_public_port}.conf"
+	wssc_upstream=$(stream_upstream_name "$DOMAIN" "$wssc_public_port")
+	wssc_map_variable="redirect_${wssc_public_port}_tls_backend"
+	wssc_reject_upstream="redirect_${wssc_public_port}_reject"
+
+	if [ "${TLS_PASSTHROUGH:-0}" -eq 1 ]; then
+		wssc_backend_port=$BACKEND_PORT
+		wssc_description="TLS is passed through without termination directly to the TLS-capable backend for $DOMAIN."
+	else
+		wssc_backend_port=$TLS_INTERNAL_PORT
+		wssc_description="TLS terminates on the internal HTTPS listener configured for $DOMAIN."
+	fi
+
+	make_temp_for "$wssc_target"
+
+	cat > "$CURRENT_TMP" <<- STREAM_CONF
+		# Managed public TLS/SNI gateway on port $wssc_public_port.
+		# Port $wssc_public_port is handled at the TCP layer. $wssc_description
+
+		map \$ssl_preread_server_name \$$wssc_map_variable {
+		    default $wssc_reject_upstream;
+		    $DOMAIN $wssc_upstream;
+		}
+
+		upstream $wssc_upstream {
+		    server 127.0.0.1:$wssc_backend_port;
+		}
+
+		# Unknown or absent SNI is rejected through a local discard endpoint.
+		upstream $wssc_reject_upstream {
+		    server 127.0.0.1:9;
+		}
+
+		server {
+		    listen $wssc_public_port;
+		    ${IPV6_LISTEN_PREFIX}listen [::]:$wssc_public_port;
+
+		    ssl_preread on;
+		    proxy_pass \$$wssc_map_variable;
+		    proxy_connect_timeout 2s;
+		    proxy_timeout 1h;
+		}
+	STREAM_CONF
+
+	commit_temp_file "$wssc_target" 0644
+	STREAM_CONFIG=$wssc_target
+	unset wssc_public_port wssc_target wssc_upstream wssc_map_variable \
+		wssc_reject_upstream wssc_backend_port wssc_description
+}
+
+validate_location_path() {
+	vlp_candidate=$1
+
+	case $vlp_candidate in
+		/*) ;;
+		*)
+			unset vlp_candidate
+			return 1
+			;;
+	esac
+
+	case $vlp_candidate in
+		*[!A-Za-z0-9_./~+%-]* | *//* | */../* | */.. | ../* | ..)
+			unset vlp_candidate
+			return 1
+			;;
+	esac
+
+	unset vlp_candidate
+	return 0
+}
+
+validate_proxy_url() {
+	vpu_candidate=$1
+
+	case $vpu_candidate in
+		http://*)
+			vpu_rest=${vpu_candidate#http://}
+			;;
+		https://*)
+			vpu_rest=${vpu_candidate#https://}
+			;;
+		*)
+			unset vpu_candidate
+			return 1
+			;;
+	esac
+
+	case $vpu_candidate in
+		*[!A-Za-z0-9_./:@?\&=%+,\[\]-]*)
+			unset vpu_candidate vpu_rest
+			return 1
+			;;
+	esac
+
+	vpu_authority=${vpu_rest%%/*}
+	case $vpu_authority in
+		*\?*)
+			vpu_authority=${vpu_authority%%\?*}
+			;;
+	esac
+
+	[ -n "$vpu_authority" ] || {
+		unset vpu_candidate vpu_rest vpu_authority
+		return 1
+	}
+
+	case $vpu_authority in
+		*@* | *\&* | *=* | *,*)
+			unset vpu_candidate vpu_rest vpu_authority
+			return 1
+			;;
+	esac
+
+	case $vpu_authority in
+		\[*\]*)
+			vpu_host=${vpu_authority#\[}
+			vpu_host=${vpu_host%%\]*}
+			vpu_suffix=${vpu_authority#*\]}
+
+			if ! validate_ipv6 "$vpu_host"; then
+				unset vpu_candidate vpu_rest vpu_authority \
+					vpu_host vpu_suffix
+				return 1
+			fi
+
+			case $vpu_suffix in
+				'') ;;
+				:*)
+					vpu_port=${vpu_suffix#:}
+					if ! validate_port "$vpu_port"; then
+						unset vpu_candidate vpu_rest vpu_authority \
+							vpu_host vpu_suffix vpu_port
+						return 1
+					fi
+					unset vpu_port
+					;;
+				*)
+					unset vpu_candidate vpu_rest vpu_authority \
+						vpu_host vpu_suffix
+					return 1
+					;;
+			esac
+			;;
+		*:*)
+			case $vpu_authority in
+				*:*:*)
+					unset vpu_candidate vpu_rest vpu_authority
+					return 1
+					;;
+			esac
+
+			vpu_host=${vpu_authority%%:*}
+			vpu_port=${vpu_authority#*:}
+			if ! validate_port "$vpu_port"; then
+				unset vpu_candidate vpu_rest vpu_authority \
+					vpu_host vpu_port
+				return 1
+			fi
+			unset vpu_port
+
+			if ! validate_proxy_host "$vpu_host"; then
+				unset vpu_candidate vpu_rest vpu_authority vpu_host
+				return 1
+			fi
+			;;
+		*)
+			vpu_host=$vpu_authority
+			if ! validate_proxy_host "$vpu_host"; then
+				unset vpu_candidate vpu_rest vpu_authority vpu_host
+				return 1
+			fi
+			;;
+	esac
+
+	unset vpu_candidate vpu_rest vpu_authority vpu_host vpu_suffix
+	return 0
+}
+
+append_common_proxy_headers() {
+	acph_fragment=$1
+	acph_forwarded_port=$2
+	acph_timeout=${3:-60s}
+
+	cat >> "$acph_fragment" <<- PROXY_HEADERS
+		        proxy_http_version 1.1;
+		        proxy_set_header Host \$http_host;
+		        proxy_set_header X-Forwarded-Host \$http_host;
+		        proxy_set_header X-Forwarded-Port $acph_forwarded_port;
+		        proxy_set_header X-Real-IP \$remote_addr;
+		        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+		        proxy_set_header X-Forwarded-Proto \$scheme;
+		        proxy_connect_timeout 10s;
+		        proxy_send_timeout $acph_timeout;
+		        proxy_read_timeout $acph_timeout;
+	PROXY_HEADERS
+
+	unset acph_fragment acph_forwarded_port acph_timeout
+}
+
+collect_custom_locations() {
+	ccl_forwarded_port=$1
+	LOCATION_FRAGMENT="$BACKUP_DIR/location-blocks.conf"
+	: > "$LOCATION_FRAGMENT" \
+		|| fatal "Could not create the location-block workspace."
+	chmod 0600 "$LOCATION_FRAGMENT" \
+		|| fatal "Could not secure the location-block workspace."
+
+	printf '\n\033[1mCustom location examples:\033[0m\n'
+	printf '  Static files: location / { root /var/www/site; try_files $uri $uri/ =404; }\n'
+	printf '  HTTP proxy:   location /api/ { proxy_pass http://127.0.0.1:3001; ... }\n'
+	printf '  WebSocket:    location /ws/ { proxy_pass http://127.0.0.1:3002; Upgrade headers... }\n\n'
+
+	ccl_count=0
+
+	while :; do
+		while :; do
+			printf 'Location path (for example /, /api/, or /ws/): '
+			if ! IFS= read -r ccl_path; then
+				fatal "Input ended while collecting location blocks."
+			fi
+
+			if ! validate_location_path "$ccl_path"; then
+				log_warn "Use a safe URI-prefix location beginning with /; regex modifiers and Nginx control characters are rejected."
+				continue
+			fi
+
+			if grep -F "# LOCATION: $ccl_path" "$LOCATION_FRAGMENT" \
+				> /dev/null 2>&1; then
+				log_warn "That location path has already been configured."
+				continue
+			fi
+			break
+		done
+
+		printf '\nSelect the location type:\n'
+		printf '  1) Static files\n'
+		printf '  2) Standard HTTP/HTTPS reverse proxy\n'
+		printf '  3) WebSocket reverse proxy\n'
+
+		while :; do
+			printf 'Choice [1-3]: '
+			if ! IFS= read -r ccl_type; then
+				fatal "Input ended while selecting a location type."
+			fi
+			case $ccl_type in
+				1 | 2 | 3)
+					break
+					;;
+				*)
+					log_warn "Enter 1, 2, or 3."
+					;;
+			esac
+		done
+
+		printf '\n# LOCATION: %s\n' "$ccl_path" >> "$LOCATION_FRAGMENT"
+
+		case $ccl_type in
+			1)
+				while :; do
+					printf 'Absolute static root path [/var/www/site]: '
+					if ! IFS= read -r ccl_static_root; then
+						fatal "Input ended while reading the static root."
+					fi
+					[ -n "$ccl_static_root" ] \
+						|| ccl_static_root=/var/www/site
+
+					if validate_absolute_path "$ccl_static_root"; then
+						break
+					fi
+					log_warn "Enter an absolute path with no spaces or Nginx control characters."
+				done
+
+				printf 'Index filename [index.html]: '
+				if ! IFS= read -r ccl_index; then
+					fatal "Input ended while reading the index filename."
+				fi
+				[ -n "$ccl_index" ] || ccl_index=index.html
+				case $ccl_index in
+					*[!A-Za-z0-9_.-]* | '')
+						fatal "Unsafe index filename: $ccl_index"
+						;;
+				esac
+
+				cat >> "$LOCATION_FRAGMENT" <<- STATIC_LOCATION
+					    location $ccl_path {
+					        root $ccl_static_root;
+					        index $ccl_index;
+					        try_files \$uri \$uri/ =404;
+					        autoindex off;
+					    }
+				STATIC_LOCATION
+
+				unset ccl_static_root ccl_index
+				;;
+			2 | 3)
+				while :; do
+					printf 'Upstream URL (for example http://127.0.0.1:3001): '
+					if ! IFS= read -r ccl_upstream; then
+						fatal "Input ended while reading the upstream URL."
+					fi
+					if validate_proxy_url "$ccl_upstream"; then
+						break
+					fi
+					log_warn "Use a valid http:// or https:// URL with a hostname, IPv4 address, or bracketed IPv6 address; credentials and Nginx control characters are rejected."
+				done
+
+				printf '    location %s {\n' "$ccl_path" >> "$LOCATION_FRAGMENT"
+				printf '        proxy_pass %s;\n' "$ccl_upstream" \
+					>> "$LOCATION_FRAGMENT"
+
+				if [ "$ccl_type" -eq 3 ]; then
+					append_common_proxy_headers \
+						"$LOCATION_FRAGMENT" "$ccl_forwarded_port" 3600s
+				else
+					append_common_proxy_headers \
+						"$LOCATION_FRAGMENT" "$ccl_forwarded_port" 60s
+				fi
+
+				if [ "$ccl_type" -eq 3 ]; then
+					cat >> "$LOCATION_FRAGMENT" <<- WEBSOCKET_HEADERS
+						        proxy_set_header Upgrade \$http_upgrade;
+						        proxy_set_header Connection \$$WS_MAP_VAR;
+						        proxy_buffering off;
+						        proxy_cache off;
+					WEBSOCKET_HEADERS
+				fi
+
+				printf '    }\n' >> "$LOCATION_FRAGMENT"
+				unset ccl_upstream
+				;;
+		esac
+
+		ccl_count=$((ccl_count + 1))
+		unset ccl_path ccl_type
+
+		if ! confirm "Add another location block?" no; then
+			break
+		fi
+		printf '\n'
+	done
+
+	[ "$ccl_count" -gt 0 ] \
+		|| fatal "At least one location block is required."
+
+	unset ccl_forwarded_port ccl_count
+}
+
+prompt_raw_tls_backend_port() {
+	while :; do
+		printf 'Desired raw TLS backend port [3000]: '
+		if ! IFS= read -r prtbp_candidate; then
+			fatal "Input ended before a raw TLS backend port was provided."
+		fi
+		[ -n "$prtbp_candidate" ] || prtbp_candidate=3000
+
+		if validate_port "$prtbp_candidate"; then
+			BACKEND_PORT=$prtbp_candidate
+			log_success "Selected raw TLS backend port: $BACKEND_PORT"
+			unset prtbp_candidate
+			return 0
+		fi
+
+		log_warn "Enter a numeric TCP port from 1 through 65535."
+	done
+}
+
+choose_proxy_layout() {
+	cpl_forwarded_port=$1
+
+	printf '\nSelect how this HTTPS virtual host should serve traffic:\n'
+	printf '  1) Proxy every request to one manually selected backend port\n'
+	printf '  2) Build custom static/proxy/WebSocket location blocks interactively\n'
+
+	while :; do
+		printf 'Choice [1]: '
+		if ! IFS= read -r cpl_choice; then
+			fatal "Input ended before a proxy layout was selected."
+		fi
+		[ -n "$cpl_choice" ] || cpl_choice=1
+
+		case $cpl_choice in
+			1)
+				while :; do
+					printf 'Desired backend port [3000]: '
+					if ! IFS= read -r cpl_backend_port; then
+						fatal "Input ended before a backend port was provided."
+					fi
+					[ -n "$cpl_backend_port" ] || cpl_backend_port=3000
+
+					if validate_port "$cpl_backend_port"; then
+						BACKEND_PORT=$cpl_backend_port
+						unset cpl_backend_port
+						break
+					fi
+
+					log_warn "Enter a numeric TCP port from 1 through 65535."
+				done
+
+				LOCATION_FRAGMENT="$BACKUP_DIR/location-blocks.conf"
+				: > "$LOCATION_FRAGMENT" \
+					|| fatal "Could not create the proxy workspace."
+				chmod 0600 "$LOCATION_FRAGMENT" \
+					|| fatal "Could not secure the proxy workspace."
+
+				cat > "$LOCATION_FRAGMENT" <<- SINGLE_PROXY
+					    location / {
+					        proxy_pass http://127.0.0.1:$BACKEND_PORT;
+				SINGLE_PROXY
+
+				append_common_proxy_headers \
+					"$LOCATION_FRAGMENT" "$cpl_forwarded_port" 3600s
+
+				cat >> "$LOCATION_FRAGMENT" <<- SINGLE_PROXY_END
+					        proxy_set_header Upgrade \$http_upgrade;
+					        proxy_set_header Connection \$$WS_MAP_VAR;
+					    }
+				SINGLE_PROXY_END
+
+				log_success "Selected backend port: $BACKEND_PORT"
+				unset cpl_forwarded_port cpl_choice
+				return 0
+				;;
+			2)
+				collect_custom_locations "$cpl_forwarded_port"
+				unset cpl_forwarded_port cpl_choice
+				return 0
+				;;
+			*)
+				log_warn "Enter 1 or 2."
+				;;
+		esac
+	done
+}
+
+write_https_site_config() {
+	whsc_listen=$1
+	whsc_target=$2
+
+	make_temp_for "$whsc_target"
+
+	cat > "$CURRENT_TMP" <<- HTTPS_HEADER
+		# Managed HTTPS reverse-proxy virtual host for $DOMAIN.
+		# Host validation is intentionally strict.
+
+		map \$http_upgrade \$$WS_MAP_VAR {
+		    default upgrade;
+		    '' close;
+		}
+
+		server {
+		    $whsc_listen
+		    server_name $DOMAIN;
+
+		    if (\$host != "$DOMAIN") {
+		        return 444;
+		    }
+
+		    server_tokens off;
+
+		    ssl_certificate $CERT_FILE;
+		    ssl_certificate_key $KEY_FILE;
+		    ssl_protocols TLSv1.2 TLSv1.3;
+		    ssl_session_timeout 1d;
+		    ssl_session_cache shared:SSL:10m;
+		    ssl_session_tickets off;
+
+		    client_max_body_size 16m;
+		    keepalive_timeout 65s;
+
+		    add_header Strict-Transport-Security "max-age=31536000" always;
+		    add_header X-Content-Type-Options "nosniff" always;
+		    add_header X-Frame-Options "SAMEORIGIN" always;
+		    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+	HTTPS_HEADER
+
+	cat "$LOCATION_FRAGMENT" >> "$CURRENT_TMP" \
+		|| fatal "Could not append location blocks to $whsc_target."
+	printf '}\n' >> "$CURRENT_TMP"
+
+	commit_temp_file "$whsc_target" 0644
+	SITE_CONFIG=$whsc_target
+	unset whsc_listen whsc_target
+}
+
+configure_domain_mode() {
+	MODE=domain
+
+	prompt_domain "Enter the public domain to route on ports 80 and 443"
+
+	if confirm "Use Nginx-managed certificates?" yes; then
+		TLS_PASSTHROUGH=0
+		select_certificate_paths
+		validate_certificate_pair
+
+		find_random_port 10000 19999
+		TLS_INTERNAL_PORT=$SELECTED_FREE_PORT
+		unset SELECTED_FREE_PORT
+
+		WS_MAP_VAR=$(websocket_map_variable "$DOMAIN")
+		log_success "Selected internal TLS listener port: $TLS_INTERNAL_PORT"
+
+		choose_proxy_layout 443
+	else
+		TLS_PASSTHROUGH=1
+		prompt_raw_tls_backend_port
+	fi
+
+	ensure_stream_include
+	write_domain_redirect_80
+	write_stream_sni_config 443
+
+	if [ "$TLS_PASSTHROUGH" -eq 0 ]; then
+		cdm_token=$(bounded_domain_token "$DOMAIN" 80)
+		cdm_target="$NGINX_CONF_DIR/conf.d/reverse_proxy_${cdm_token}.conf"
+		cdm_listen="listen 127.0.0.1:$TLS_INTERNAL_PORT ssl;"
+		write_https_site_config "$cdm_listen" "$cdm_target"
+		unset cdm_token cdm_target cdm_listen
+	fi
+
+	unset WS_MAP_VAR LOCATION_FRAGMENT
+}
+
+configure_custom_port_mode() {
+	MODE=custom
+
+	prompt_port "Custom HTTP redirect port" 2080
+	HTTP_PORT=$PROMPTED_PORT
+	unset PROMPTED_PORT
+
+	while :; do
+		prompt_port "Custom HTTPS reverse-proxy port" 2443
+		HTTPS_PORT=$PROMPTED_PORT
+		unset PROMPTED_PORT
+
+		if [ "$HTTPS_PORT" = "$HTTP_PORT" ]; then
+			log_warn "The HTTP and HTTPS ports must differ."
+			unset HTTPS_PORT
+			continue
+		fi
+		break
+	done
+
+	prompt_domain "Enter the hostname clients will use on these custom ports"
+
+	if confirm "Use Nginx-managed certificates?" yes; then
+		TLS_PASSTHROUGH=0
+		WS_MAP_VAR=$(websocket_map_variable "$DOMAIN")
+
+		select_certificate_paths
+		validate_certificate_pair
+		choose_proxy_layout "$HTTPS_PORT"
+
+		ccpm_token=$(bounded_domain_token "$DOMAIN" 72)
+		ccpm_target="$NGINX_CONF_DIR/conf.d/custom_proxy_${ccpm_token}_${HTTP_PORT}_${HTTPS_PORT}.conf"
+		make_temp_for "$ccpm_target"
+
+		cat > "$CURRENT_TMP" <<- CUSTOM_CONFIG
+			# Managed custom-port HTTP/HTTPS reverse proxy for $DOMAIN.
+			# This file does not alter public port-80 or port-443 routing.
+
+			map \$http_upgrade \$$WS_MAP_VAR {
+			    default upgrade;
+			    '' close;
+			}
+
+			server {
+			    listen $HTTP_PORT;
+			    ${IPV6_LISTEN_PREFIX}listen [::]:$HTTP_PORT;
+			    server_name $DOMAIN;
+
+			    if (\$host != "$DOMAIN") {
+			        return 444;
+			    }
+
+			    server_tokens off;
+			    return 301 https://\$host:$HTTPS_PORT\$request_uri;
+			}
+
+			server {
+			    listen $HTTPS_PORT ssl;
+			    ${IPV6_LISTEN_PREFIX}listen [::]:$HTTPS_PORT ssl;
+			    server_name $DOMAIN;
+
+			    if (\$host != "$DOMAIN") {
+			        return 444;
+			    }
+
+			    server_tokens off;
+
+			    ssl_certificate $CERT_FILE;
+			    ssl_certificate_key $KEY_FILE;
+			    ssl_protocols TLSv1.2 TLSv1.3;
+			    ssl_session_timeout 1d;
+			    ssl_session_cache shared:SSL:10m;
+			    ssl_session_tickets off;
+
+			    client_max_body_size 16m;
+			    keepalive_timeout 65s;
+
+			    add_header Strict-Transport-Security "max-age=31536000" always;
+			    add_header X-Content-Type-Options "nosniff" always;
+			    add_header X-Frame-Options "SAMEORIGIN" always;
+			    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+		CUSTOM_CONFIG
+
+		cat "$LOCATION_FRAGMENT" >> "$CURRENT_TMP" \
+			|| fatal "Could not append custom location blocks."
+		printf '}\n' >> "$CURRENT_TMP"
+
+		commit_temp_file "$ccpm_target" 0644
+		SITE_CONFIG=$ccpm_target
+
+		unset ccpm_token ccpm_target WS_MAP_VAR LOCATION_FRAGMENT
+	else
+		TLS_PASSTHROUGH=1
+		prompt_raw_tls_backend_port
+		ensure_stream_include
+		write_forced_ssl_snippet "$HTTPS_PORT"
+		write_custom_redirect_config
+		write_stream_sni_config "$HTTPS_PORT"
+	fi
+}
+
+test_nginx_configuration() {
+	log_info "Testing the complete Nginx configuration..."
+
+	if tnc_output=$("$NGINX_BIN" -t -c "$NGINX_MAIN_CONF" 2>&1); then
+		printf '%s\n' "$tnc_output"
+		log_success "nginx -t completed successfully."
+		unset tnc_output
+		return 0
+	fi
+
+	printf '%s\n' "$tnc_output" >&2
+	log_error "The generated Nginx configuration is invalid."
+	unset tnc_output
+	rollback_transaction
+
+	log_info "Testing the restored configuration..."
+	if tnc_restored=$("$NGINX_BIN" -t -c "$NGINX_MAIN_CONF" 2>&1); then
+		printf '%s\n' "$tnc_restored"
+		log_success "Rollback restored a valid Nginx configuration."
+	else
+		printf '%s\n' "$tnc_restored" >&2
+		log_error "The restored configuration also fails nginx -t; inspect existing Nginx files manually."
+	fi
+
+	unset tnc_restored
+	exit 1
+}
+
+restart_nginx() {
+	log_info "Restarting Nginx..."
+
+	rn_restarted=0
+
+	if command_exists systemctl; then
+		if systemctl restart nginx; then
+			rn_restarted=1
+			log_success "Nginx restarted successfully with systemctl."
+			printf '\n'
+			systemctl --no-pager --full status nginx || :
+		fi
+	fi
+
+	if [ "$rn_restarted" -eq 0 ] && command_exists service; then
+		if service nginx restart; then
+			rn_restarted=1
+			log_success "Nginx restarted successfully with service."
+			printf '\n'
+			service nginx status || :
+		fi
+	fi
+
+	if [ "$rn_restarted" -eq 1 ]; then
+		unset rn_restarted
+		return 0
+	fi
+
+	unset rn_restarted
+	if ! command_exists systemctl && ! command_exists service; then
+		fatal "Neither systemctl nor service is available to restart Nginx."
+	fi
+
+	log_error "Nginx failed to restart; rolling back managed changes."
+	rollback_transaction
+
+	if "$NGINX_BIN" -t -c "$NGINX_MAIN_CONF" > /dev/null 2>&1; then
+		if command_exists systemctl; then
+			systemctl restart nginx > /dev/null 2>&1 || :
+		elif command_exists service; then
+			service nginx restart > /dev/null 2>&1 || :
+		fi
+	fi
+
+	fatal "Nginx restart failed. Previous managed files were restored where backups were available."
+}
+
+print_summary() {
+	printf '\n\033[1mConfiguration summary\033[0m\n'
+	printf '  Mode:                 %s\n' "$MODE"
+	printf '  Hostname:             %s\n' "$DOMAIN"
+
+	if [ "${TLS_PASSTHROUGH:-0}" -eq 1 ]; then
+		printf '  TLS handling:         Raw TLS passthrough\n'
+	else
+		printf '  TLS handling:         Nginx-managed certificates\n'
+		printf '  Certificate:          %s\n' "$CERT_FILE"
+		printf '  Private key:          %s\n' "$KEY_FILE"
+		printf '  Site configuration:   %s\n' "$SITE_CONFIG"
+	fi
+
+	if [ "$MODE" = domain ]; then
+		printf '  Public HTTP:          80\n'
+		printf '  Public HTTPS/SNI:     443\n'
+		if [ "${TLS_PASSTHROUGH:-0}" -eq 0 ]; then
+			printf '  Internal TLS port:    %s\n' "$TLS_INTERNAL_PORT"
+		fi
+		if [ -n "${HTTP_REDIRECT_CONFIG:-}" ]; then
+			printf '  HTTP redirect config: %s\n' "$HTTP_REDIRECT_CONFIG"
+		fi
+		printf '  Stream configuration: %s\n' "$STREAM_CONFIG"
+	else
+		printf '  Custom HTTP port:     %s\n' "$HTTP_PORT"
+		printf '  Custom HTTPS port:    %s\n' "$HTTPS_PORT"
+		if [ "${TLS_PASSTHROUGH:-0}" -eq 1 ]; then
+			printf '  Forced-SSL snippet:   %s\n' "$REDIRECT_SNIPPET"
+			printf '  HTTP redirect config: %s\n' "$HTTP_REDIRECT_CONFIG"
+			printf '  Stream configuration: %s\n' "$STREAM_CONFIG"
+		fi
+	fi
+
+	if [ -n "${BACKEND_PORT:-}" ]; then
+		if [ "${TLS_PASSTHROUGH:-0}" -eq 1 ]; then
+			printf '  Selected backend:     tls://127.0.0.1:%s\n' "$BACKEND_PORT"
+			log_warn "Start your TLS backend service on 127.0.0.1:$BACKEND_PORT before sending production traffic."
+		else
+			printf '  Selected backend:     http://127.0.0.1:%s\n' "$BACKEND_PORT"
+			log_warn "Start your backend service on 127.0.0.1:$BACKEND_PORT before sending production traffic."
+		fi
+	fi
+
+	printf '  Transaction backups: %s\n\n' "$BACKUP_DIR"
+
+	unset MODE DOMAIN CERT_FILE KEY_FILE SITE_CONFIG STREAM_CONFIG \
+		HTTP_REDIRECT_CONFIG REDIRECT_SNIPPET TLS_INTERNAL_PORT HTTP_PORT \
+		HTTPS_PORT BACKEND_PORT TLS_PASSTHROUGH
+}
+
+main() {
+	require_root
+	reset_internal_state
+	initialize_runtime_paths
+
+	if load_management_state; then
+		printf '\033[1mNginx Reverse-Proxy Manager\033[0m\n'
+		log_success "Detected an existing Nginx instance managed by this script."
+		validate_existing_managed_runtime
+		ensure_directories
+		init_transaction
+		ensure_managed_support_files
+	else
+		MANAGED_EXISTING=0
+		prompt_ipv6_support
+		printf '\033[1mNginx Reverse-Proxy Manager\033[0m\n'
+		printf 'This installer will install packages and modify Nginx configuration files.\n\n'
+
+		if ! confirm "Proceed with package installation and transactional Nginx changes?" no; then
+			log_warn "No changes were made."
+			unset NGINX_CONF_DIR NGINX_MAIN_CONF NGINX_BIN STATE_FILE \
+				IPV6_ENABLED IPV6_LISTEN_PREFIX MANAGED_EXISTING
+			exit 0
+		fi
+
+		install_packages
+		ensure_directories
+		init_transaction
+		remove_default_site
+		write_redirect_snippet
+	fi
+
+	display_inventory
+
+	printf 'Enable domain-based public routing on ports 80 and 443?\n'
+	printf 'Choose no to create an isolated custom-port HTTP/HTTPS setup instead.\n'
+
+	if confirm "Use public 80/443 domain and SNI routing?" yes; then
+		configure_domain_mode
+	else
+		write_redirect_80
+		configure_custom_port_mode
+	fi
+
+	write_management_state
+	test_nginx_configuration
+	restart_nginx
+
+	TRANSACTION_ACTIVE=0
+	cleanup_temp
+	print_summary
+
+	unset TRANSACTION_ACTIVE ROLLBACK_DONE MANIFEST BACKUP_DIR \
+		PORT_CHECKER NGINX_CONF_DIR NGINX_MAIN_CONF NGINX_BIN \
+		IPV6_ENABLED IPV6_LISTEN_PREFIX STATE_FILE MANAGED_EXISTING \
+		MANAGED_INSTALLED_AT MANAGED_LAST_CONFIGURED_AT TLS_PASSTHROUGH \
+		HTTP_REDIRECT_CONFIG REDIRECT_SNIPPET
+
+	log_success "Nginx reverse-proxy configuration completed."
+}
+
+if [ "${NGINX_RPM_NO_MAIN:-0}" != 1 ]; then
+	main "$@"
+fi

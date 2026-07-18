@@ -150,7 +150,8 @@ reset_internal_state() {
 		HTTP_REDIRECT_CONFIG REDIRECT_SNIPPET LOCATION_FRAGMENT UPSTREAM_FRAGMENT \
 		WS_MAP_VAR PROMPTED_FILE PROMPTED_PORT SELECTED_FREE_PORT IPV6_ENABLED \
 		IPV6_LISTEN_PREFIX STATE_FILE MANAGED_EXISTING MANAGED_INSTALLED_AT \
-		MANAGED_LAST_CONFIGURED_AT
+		MANAGED_LAST_CONFIGURED_AT MANAGED_NODE_ACTION MANAGED_NODE_DESCRIPTION \
+		MANAGED_NEW_PORT
 }
 
 initialize_runtime_paths() {
@@ -1404,8 +1405,8 @@ select_certificate_paths() {
 
 	for scp_pair in \
 		"$NGINX_CONF_DIR/../letsencrypt/live/$DOMAIN/fullchain.pem|$NGINX_CONF_DIR/../letsencrypt/live/$DOMAIN/privkey.pem" \
-		"$NGINX_CONF_DIR/certs/$DOMAIN.crt|$NGINX_CONF_DIR/certs/$DOMAIN.key" \
-		"$NGINX_CONF_DIR/certs/$DOMAIN.cer|$NGINX_CONF_DIR/certs/$DOMAIN.key" \
+		"$NGINX_CONF_DIR/ssl/$DOMAIN.crt|$NGINX_CONF_DIR/ssl/$DOMAIN.key" \
+		"$NGINX_CONF_DIR/ssl/$DOMAIN.cer|$NGINX_CONF_DIR/ssl/$DOMAIN.key" \
 		"/etc/ssl/$DOMAIN/$DOMAIN.crt|/etc/ssl/$DOMAIN/$DOMAIN.key"; do
 		scp_cert=${scp_pair%%|*}
 		scp_key=${scp_pair#*|}
@@ -2293,7 +2294,7 @@ collect_custom_locations() {
 					if validate_proxy_url "$ccl_upstream"; then
 						break
 					fi
-					log_warn "Use a valid http:// or https:// URL with a hostname, IPv4 address, or bracketed IPv6 address; credentials and Nginx control characters are rejected."
+					log_warn "Use a valid http:// or https:// URL with a domain, IPv4 address, or bracketed IPv6 address; credentials and Nginx control characters are rejected."
 				done
 
 				printf '    location %s {\n' "$ccl_path" >> "$LOCATION_FRAGMENT"
@@ -2642,7 +2643,7 @@ configure_custom_port_mode() {
 		break
 	done
 
-	prompt_domain "Enter the hostname clients will use on these custom ports"
+	prompt_domain "Enter the domain clients will use on these custom ports"
 
 	if confirm "Use Nginx-managed certificates?" yes; then
 		TLS_PASSTHROUGH=0
@@ -2675,7 +2676,790 @@ configure_custom_port_mode() {
 	fi
 }
 
-test_nginx_configuration() {
+has_managed_configurations() {
+	hmc_first=$(managed_conf_files | sed -n '1p')
+
+	if [ -n "$hmc_first" ]; then
+		unset hmc_first
+		return 0
+	fi
+
+	unset hmc_first
+	return 1
+}
+
+build_management_inventory() {
+	bmi_output=$1
+	bmi_listeners="$BACKUP_DIR/manage-listeners.txt"
+	bmi_upstreams="$BACKUP_DIR/manage-upstreams.txt"
+
+	build_listener_inventory "$bmi_listeners"
+	build_upstream_inventory "$bmi_upstreams"
+
+	: > "$bmi_output" \
+		|| fatal "Could not create the configuration-management inventory."
+
+	awk -F '|' '{ print "listener|" $1 "|" $2 "|" $3 }' \
+		"$bmi_listeners" >> "$bmi_output" \
+		|| fatal "Could not add managed listeners to the configuration-management inventory."
+	awk -F '|' '{ print "upstream|" $1 "|" $2 "|" $3 }' \
+		"$bmi_upstreams" >> "$bmi_output" \
+		|| fatal "Could not add managed upstreams to the configuration-management inventory."
+
+	chmod 0600 "$bmi_output" \
+		|| fatal "Could not secure the configuration-management inventory."
+
+	unset bmi_output bmi_listeners bmi_upstreams
+}
+
+extract_endpoint_port() {
+	eep_value=$1
+	eep_endpoint=${eep_value%% *}
+
+	case $eep_endpoint in
+		\[*\]:*) eep_port=${eep_endpoint##*:} ;;
+		*:*) eep_port=${eep_endpoint##*:} ;;
+		*) eep_port=$eep_endpoint ;;
+	esac
+
+	if validate_port "$eep_port"; then
+		EXTRACTED_PORT=$eep_port
+		unset eep_value eep_endpoint eep_port
+		return 0
+	fi
+
+	unset eep_value eep_endpoint eep_port
+	return 1
+}
+
+change_listener_port() {
+	prlp_old_port=$1
+
+	while :; do
+		printf 'New listener port (current %s): ' "$prlp_old_port"
+		if ! IFS= read -r prlp_candidate; then
+			fatal "Input ended before a replacement listener port was provided."
+		fi
+
+		if ! validate_port "$prlp_candidate"; then
+			log_warn "Enter a numeric TCP port from 1 through 65535."
+			continue
+		fi
+
+		if [ "$prlp_candidate" = "$prlp_old_port" ]; then
+			log_warn "The replacement listener port must differ from the current port."
+			continue
+		fi
+
+		if port_in_use "$prlp_candidate"; then
+			log_warn "TCP port $prlp_candidate currently has a listening socket."
+			if ! confirm "Use this listener port anyway?" no; then
+				continue
+			fi
+		fi
+
+		MANAGED_NEW_PORT=$prlp_candidate
+		unset prlp_old_port prlp_candidate
+		return 0
+	done
+}
+
+change_upstream_port() {
+	prup_old_port=$1
+
+	while :; do
+		printf 'New backend port (current %s): ' "$prup_old_port"
+		if ! IFS= read -r prup_candidate; then
+			fatal "Input ended before a replacement backend port was provided."
+		fi
+
+		if ! validate_port "$prup_candidate"; then
+			log_warn "Enter a numeric TCP port from 1 through 65535."
+			continue
+		fi
+
+		if [ "$prup_candidate" = "$prup_old_port" ]; then
+			log_warn "The replacement backend port must differ from the current port."
+			continue
+		fi
+
+		MANAGED_NEW_PORT=$prup_candidate
+		unset prup_old_port prup_candidate
+		return 0
+	done
+}
+
+finalize_selected_file() {
+	csmf_target=$1
+	csmf_mode=$2
+
+	[ -n "${CURRENT_TMP:-}" ] \
+		|| fatal "Internal error: no managed configuration candidate is ready for $csmf_target."
+
+	if ! is_script_managed_file "$csmf_target"; then
+		cleanup_temp
+		log_error "The selected file is no longer recognized as script-managed: $csmf_target"
+		unset csmf_target csmf_mode
+		return 1
+	fi
+
+	if ! validate_nginx_candidate "$csmf_target" "$CURRENT_TMP"; then
+		cleanup_temp
+		unset csmf_target csmf_mode
+		return 1
+	fi
+
+	chmod "$csmf_mode" "$CURRENT_TMP" \
+		|| fatal "Could not set permissions on the managed configuration candidate for $csmf_target."
+
+	log_warn "Updating the selected script-managed configuration: $csmf_target"
+	log_info "No overwrite confirmation is required because this node was selected explicitly; a transactional rollback backup will be created."
+	backup_existing_file "$csmf_target" \
+		|| fatal "Could not create the rollback backup for $csmf_target."
+
+	mv -f "$CURRENT_TMP" "$csmf_target" \
+		|| fatal "Could not atomically install the updated managed configuration: $csmf_target"
+
+	unset CURRENT_TMP
+	log_success "Updated managed configuration: $csmf_target"
+	unset csmf_target csmf_mode
+	return 0
+}
+
+replace_listener_port() {
+	rlpc_source=$1
+	rlpc_old_port=$2
+	rlpc_new_port=$3
+	rlpc_output=$4
+
+	awk -v old_port="$rlpc_old_port" -v new_port="$rlpc_new_port" '
+		function replace_port_tokens(text, pattern, matched, leading, trailing,
+			before, after) {
+			pattern = "(^|[^0-9])" old_port "([^0-9]|$)"
+			while (match(text, pattern)) {
+				matched = substr(text, RSTART, RLENGTH)
+				leading = ""
+				trailing = ""
+				if (substr(matched, 1, 1) !~ /[0-9]/) {
+					leading = substr(matched, 1, 1)
+				}
+				if (substr(matched, length(matched), 1) !~ /[0-9]/) {
+					trailing = substr(matched, length(matched), 1)
+				}
+				before = substr(text, 1, RSTART - 1)
+				after = substr(text, RSTART + RLENGTH)
+				text = before leading new_port trailing after
+			}
+			return text
+		}
+		function replace_listen_endpoint(line, prefix, value, token, suffix,
+			separator_position, endpoint_prefix) {
+			match(line, /^[[:space:]]*listen[[:space:]]+/)
+			prefix = substr(line, 1, RLENGTH)
+			value = substr(line, RLENGTH + 1)
+			separator_position = match(value, /[[:space:];]/)
+			if (separator_position == 0) {
+				token = value
+				suffix = ""
+			} else {
+				token = substr(value, 1, separator_position - 1)
+				suffix = substr(value, separator_position)
+			}
+
+			if (token == old_port) {
+				token = new_port
+			} else if (length(token) > length(old_port) + 1 &&
+				substr(token, length(token) - length(old_port), 1) == ":" &&
+				substr(token, length(token) - length(old_port) + 1) == old_port) {
+				endpoint_prefix = substr(token, 1, length(token) - length(old_port))
+				token = endpoint_prefix new_port
+			}
+
+			return prefix token suffix
+		}
+		{
+			line = $0
+			if (line ~ /^[[:space:]]*listen[[:space:]]+/) {
+				line = replace_listen_endpoint(line)
+			} else if (line ~ /return[[:space:]]+30[1278][[:space:]]+https:\/\// ||
+				line ~ /proxy_set_header[[:space:]]+X-Forwarded-Port[[:space:]]+/ ||
+				line ~ /redirect_[0-9]+_/ || line ~ /sni_[0-9]+_/) {
+				line = replace_port_tokens(line)
+			}
+			print line
+		}
+	' "$rlpc_source" > "$rlpc_output"
+	rlpc_status=$?
+
+	unset rlpc_source rlpc_old_port rlpc_new_port rlpc_output
+	if [ "$rlpc_status" -eq 0 ]; then
+		unset rlpc_status
+		return 0
+	fi
+	unset rlpc_status
+	return 1
+}
+
+replace_upstream_port_candidate() {
+	rupc_source=$1
+	rupc_name=$2
+	rupc_target=$3
+	rupc_old_port=$4
+	rupc_new_port=$5
+	rupc_output=$6
+
+	awk -v wanted_name="$rupc_name" -v wanted_target="$rupc_target" \
+		-v old_port="$rupc_old_port" -v new_port="$rupc_new_port" '
+		function trim(value) {
+			sub(/^[[:space:]]+/, "", value)
+			sub(/[[:space:]]+$/, "", value)
+			return value
+		}
+		function replace_port_tokens(text, pattern, matched, leading, trailing,
+			before, after) {
+			pattern = "(^|[^0-9])" old_port "([^0-9]|$)"
+			while (match(text, pattern)) {
+				matched = substr(text, RSTART, RLENGTH)
+				leading = ""
+				trailing = ""
+				if (substr(matched, 1, 1) !~ /[0-9]/) {
+					leading = substr(matched, 1, 1)
+				}
+				if (substr(matched, length(matched), 1) !~ /[0-9]/) {
+					trailing = substr(matched, length(matched), 1)
+				}
+				before = substr(text, 1, RSTART - 1)
+				after = substr(text, RSTART + RLENGTH)
+				text = before leading new_port trailing after
+			}
+			return text
+		}
+		BEGIN {
+			in_upstream = 0
+			depth = 0
+			matched_server = 0
+		}
+		{
+			line = $0
+			if (!in_upstream && line ~ /^[[:space:]]*upstream[[:space:]]+/) {
+				name = line
+				sub(/^[[:space:]]*upstream[[:space:]]+/, "", name)
+				sub(/[[:space:]]*\{.*$/, "", name)
+				if (name == wanted_name) {
+					in_upstream = 1
+					depth = 0
+				}
+			}
+
+			if (in_upstream && line ~ /^[[:space:]]*server[[:space:]]+/) {
+				value = line
+				sub(/^[[:space:]]*server[[:space:]]+/, "", value)
+				sub(/;[[:space:]]*$/, "", value)
+				value = trim(value)
+				if (value == wanted_target) {
+					line = replace_port_tokens(line)
+					matched_server = 1
+				}
+			}
+
+			print line
+
+			if (in_upstream) {
+				opening = $0
+				closing = $0
+				open_count = gsub(/\{/, "", opening)
+				close_count = gsub(/\}/, "", closing)
+				depth += open_count - close_count
+				if (depth == 0) {
+					in_upstream = 0
+				}
+			}
+		}
+		END { exit(matched_server ? 0 : 2) }
+	' "$rupc_source" > "$rupc_output"
+	rupc_status=$?
+
+	unset rupc_source rupc_name rupc_target rupc_old_port rupc_new_port rupc_output
+	if [ "$rupc_status" -eq 0 ]; then
+		unset rupc_status
+		return 0
+	fi
+	unset rupc_status
+	return 1
+}
+
+remove_listener_candidate() {
+	rlc_source=$1
+	rlc_listen=$2
+	rlc_server=$3
+	rlc_output=$4
+
+	awk -v wanted_listen="$rlc_listen" -v wanted_server="$rlc_server" '
+		function trim(value) {
+			sub(/^[[:space:]]+/, "", value)
+			sub(/[[:space:]]+$/, "", value)
+			return value
+		}
+		BEGIN {
+			in_server = 0
+			depth = 0
+			removed = 0
+		}
+		{
+			line = $0
+			if (!in_server && line ~ /^[[:space:]]*server[[:space:]]*\{/) {
+				in_server = 1
+				depth = 0
+				block = ""
+				listen_match = 0
+				server_name = ""
+			}
+
+			if (in_server) {
+				block = block line ORS
+
+				if (line ~ /^[[:space:]]*listen[[:space:]]+/) {
+					value = line
+					sub(/^[[:space:]]*listen[[:space:]]+/, "", value)
+					sub(/;[[:space:]]*$/, "", value)
+					if (trim(value) == wanted_listen) {
+						listen_match = 1
+					}
+				}
+
+				if (line ~ /^[[:space:]]*server_name[[:space:]]+/) {
+					value = line
+					sub(/^[[:space:]]*server_name[[:space:]]+/, "", value)
+					sub(/;[[:space:]]*$/, "", value)
+					server_name = trim(value)
+				}
+
+				opening = line
+				closing = line
+				open_count = gsub(/\{/, "", opening)
+				close_count = gsub(/\}/, "", closing)
+				depth += open_count - close_count
+
+				if (depth == 0) {
+					name_match = (wanted_server == "stream/SNI gateway") \
+						? (server_name == "") : (server_name == wanted_server)
+					if (!removed && listen_match && name_match) {
+						removed = 1
+					} else {
+						printf "%s", block
+					}
+					in_server = 0
+				}
+			} else {
+				print line
+			}
+		}
+		END {
+			if (in_server) {
+				printf "%s", block
+			}
+			exit(removed ? 0 : 2)
+		}
+	' "$rlc_source" > "$rlc_output"
+	rlc_status=$?
+
+	unset rlc_source rlc_listen rlc_server rlc_output
+	if [ "$rlc_status" -eq 0 ]; then
+		unset rlc_status
+		return 0
+	fi
+	unset rlc_status
+	return 1
+}
+
+remove_upstream_candidate() {
+	ruc_source=$1
+	ruc_name=$2
+	ruc_output=$3
+
+	awk -v wanted_name="$ruc_name" '
+		BEGIN {
+			in_upstream = 0
+			depth = 0
+			removed = 0
+		}
+		{
+			line = $0
+			if (!in_upstream && line ~ /^[[:space:]]*upstream[[:space:]]+/) {
+				name = line
+				sub(/^[[:space:]]*upstream[[:space:]]+/, "", name)
+				sub(/[[:space:]]*\{.*$/, "", name)
+				if (!removed && name == wanted_name) {
+					in_upstream = 1
+					depth = 0
+				}
+			}
+
+			if (in_upstream) {
+				opening = line
+				closing = line
+				open_count = gsub(/\{/, "", opening)
+				close_count = gsub(/\}/, "", closing)
+				depth += open_count - close_count
+				if (depth == 0) {
+					in_upstream = 0
+					removed = 1
+				}
+				next
+			}
+
+			print line
+		}
+		END { exit(removed ? 0 : 2) }
+	' "$ruc_source" > "$ruc_output"
+	ruc_status=$?
+
+	unset ruc_source ruc_name ruc_output
+	if [ "$ruc_status" -eq 0 ]; then
+		unset ruc_status
+		return 0
+	fi
+	unset ruc_status
+	return 1
+}
+
+modify_managed_listener() {
+	ml_file=$1
+	ml_listen=$2
+	ml_server=$3
+
+	if ! extract_endpoint_port "$ml_listen"; then
+		log_error "Could not determine the numeric port from managed listener: $ml_listen"
+		unset ml_file ml_listen ml_server
+		return 1
+	fi
+	ml_old_port=$EXTRACTED_PORT
+	unset EXTRACTED_PORT
+
+	while :; do
+		change_listener_port "$ml_old_port"
+		ml_new_port=$MANAGED_NEW_PORT
+		unset MANAGED_NEW_PORT
+
+		make_temp_for "$ml_file"
+		replace_listener_port "$ml_file" "$ml_old_port" \
+			"$ml_new_port" "$CURRENT_TMP" \
+			|| fatal "Could not generate the listener-port replacement candidate."
+
+		log_warn "Every port-aware reference to $ml_old_port in $ml_file will be updated to $ml_new_port so related redirects, forwarded-port headers, and generated identifiers remain consistent."
+		if finalize_selected_file "$ml_file" 0644; then
+			MODE=manage
+			MANAGED_NODE_ACTION="Changed listener port $ml_old_port to $ml_new_port"
+			MANAGED_NODE_DESCRIPTION="$ml_server in $ml_file"
+			unset ml_file ml_listen ml_server ml_old_port ml_new_port
+			return 0
+		fi
+
+		log_warn "The listener-port change was rejected by nginx -t; the live configuration was not modified."
+		if ! confirm "Try a different listener port?" yes; then
+			unset ml_file ml_listen ml_server ml_old_port ml_new_port
+			return 1
+		fi
+		unset ml_new_port
+	done
+}
+
+modify_managed_upstream() {
+	mmu_file=$1
+	mmu_name=$2
+	mmu_target=$3
+
+	if ! extract_endpoint_port "$mmu_target"; then
+		log_error "Could not determine the numeric backend port from upstream target: $mmu_target"
+		unset mmu_file mmu_name mmu_target
+		return 1
+	fi
+	mmu_old_port=$EXTRACTED_PORT
+	unset EXTRACTED_PORT
+
+	while :; do
+		change_upstream_port "$mmu_old_port"
+		mmu_new_port=$MANAGED_NEW_PORT
+		unset MANAGED_NEW_PORT
+
+		make_temp_for "$mmu_file"
+		if ! replace_upstream_port_candidate "$mmu_file" "$mmu_name" \
+			"$mmu_target" "$mmu_old_port" "$mmu_new_port" "$CURRENT_TMP"; then
+			cleanup_temp
+			log_error "Could not locate the selected upstream server directive in $mmu_file."
+			unset mmu_file mmu_name mmu_target mmu_old_port mmu_new_port
+			return 1
+		fi
+
+		if finalize_selected_file "$mmu_file" 0644; then
+			MODE=manage
+			MANAGED_NODE_ACTION="Changed upstream port $mmu_old_port to $mmu_new_port"
+			MANAGED_NODE_DESCRIPTION="$mmu_name in $mmu_file"
+			unset mmu_file mmu_name mmu_target mmu_old_port mmu_new_port
+			return 0
+		fi
+
+		log_warn "The upstream-port change was rejected by nginx -t; the live configuration was not modified."
+		if ! confirm "Try a different backend port?" yes; then
+			unset mmu_file mmu_name mmu_target mmu_old_port mmu_new_port
+			return 1
+		fi
+		unset mmu_new_port
+	done
+}
+
+remove_managed_listener() {
+	rml_file=$1
+	rml_listen=$2
+	rml_server=$3
+
+	log_warn "Removing this listener removes its complete server block from $rml_file."
+	log_warn "Related redirects or upstreams in other blocks are preserved and must remain valid."
+	if ! confirm "Remove listener '$rml_listen' for '$rml_server'?" no; then
+		unset rml_file rml_listen rml_server
+		return 1
+	fi
+
+	make_temp_for "$rml_file"
+	if ! remove_listener_candidate "$rml_file" "$rml_listen" \
+		"$rml_server" "$CURRENT_TMP"; then
+		cleanup_temp
+		log_error "Could not locate the selected listener server block in $rml_file."
+		unset rml_file rml_listen rml_server
+		return 1
+	fi
+
+	if ! finalize_selected_file "$rml_file" 0644; then
+		log_warn "Nginx rejected the removal, usually because another managed node still depends on this server block."
+		unset rml_file rml_listen rml_server
+		return 1
+	fi
+
+	MODE=manage
+	MANAGED_NODE_ACTION="Removed listener $rml_listen"
+	MANAGED_NODE_DESCRIPTION="$rml_server from $rml_file"
+	unset rml_file rml_listen rml_server
+	return 0
+}
+
+remove_managed_upstream() {
+	rmu_file=$1
+	rmu_name=$2
+	rmu_target=$3
+
+	log_warn "Removing this node removes the complete upstream '$rmu_name' block from $rmu_file."
+	log_warn "Nginx validation will prevent removal while any remaining proxy or stream directive still references it."
+	if ! confirm "Remove upstream '$rmu_name'?" no; then
+		unset rmu_file rmu_name rmu_target
+		return 1
+	fi
+
+	make_temp_for "$rmu_file"
+	if ! remove_upstream_candidate "$rmu_file" "$rmu_name" "$CURRENT_TMP"; then
+		cleanup_temp
+		log_error "Could not locate upstream '$rmu_name' in $rmu_file."
+		unset rmu_file rmu_name rmu_target
+		return 1
+	fi
+
+	if ! finalize_selected_file "$rmu_file" 0644; then
+		log_warn "Nginx rejected the upstream removal because the resulting configuration is not valid."
+		unset rmu_file rmu_name rmu_target
+		return 1
+	fi
+
+	MODE=manage
+	MANAGED_NODE_ACTION="Removed upstream $rmu_name"
+	MANAGED_NODE_DESCRIPTION="$rmu_target from $rmu_file"
+	unset rmu_file rmu_name rmu_target
+	return 0
+}
+
+manage_existing_confs() {
+	mec_inventory="$BACKUP_DIR/manage-nodes.txt"
+	build_management_inventory "$mec_inventory"
+	mec_total=$(awk 'END { print NR + 0 }' "$mec_inventory")
+
+	if [ "$mec_total" -eq 0 ]; then
+		log_warn "No script-managed listener, server, or upstream nodes are currently available to manage."
+		unset mec_inventory mec_total
+		return 2
+	fi
+
+	while :; do
+		printf '\n\033[1mManage existing configurations\033[0m\n'
+		awk -F '|' '
+			$1 == "listener" {
+				printf "  %d) Listener  %-28s Server: %-28s %s\n", NR, $3, $4, $2
+			}
+			$1 == "upstream" {
+				printf "  %d) Upstream  %-28s Target: %-28s %s\n", NR, $3, $4, $2
+			}
+		' "$mec_inventory"
+		printf '  0) Return to the previous menu\n'
+
+		printf 'Select a managed node [0-%s]: ' "$mec_total"
+		if ! IFS= read -r mec_choice; then
+			fatal "Input ended before a managed node was selected."
+		fi
+
+		case $mec_choice in
+			'' | *[!0-9]*)
+				log_warn "Enter a number from 0 through $mec_total."
+				continue
+				;;
+			0)
+				unset mec_inventory mec_total mec_choice
+				return 2
+				;;
+		esac
+
+		if [ "$mec_choice" -gt "$mec_total" ]; then
+			log_warn "Enter a number from 0 through $mec_total."
+			continue
+		fi
+
+		mec_line=$(sed -n "${mec_choice}p" "$mec_inventory")
+		mec_old_ifs=$IFS
+		IFS='|'
+		set -- $mec_line
+		IFS=$mec_old_ifs
+		mec_type=$1
+		mec_file=$2
+		mec_name=$3
+		mec_detail=$4
+
+		printf '\nSelected %s: %s\n' "$mec_type" "$mec_name"
+		printf '  1) Modify its port\n'
+		printf '  2) Remove this node\n'
+		printf '  3) Choose another node\n'
+
+		while :; do
+			printf 'Action [1-3]: '
+			if ! IFS= read -r mec_action; then
+				fatal "Input ended before a management action was selected."
+			fi
+
+			case $mec_action in
+				1)
+					if [ "$mec_type" = listener ]; then
+						if modify_managed_listener "$mec_file" "$mec_name" "$mec_detail"; then
+							unset mec_inventory mec_total mec_choice mec_line mec_old_ifs \
+								mec_type mec_file mec_name mec_detail mec_action
+							return 0
+						fi
+					else
+						if modify_managed_upstream "$mec_file" "$mec_name" "$mec_detail"; then
+							unset mec_inventory mec_total mec_choice mec_line mec_old_ifs \
+								mec_type mec_file mec_name mec_detail mec_action
+							return 0
+						fi
+					fi
+					log_warn "No managed configuration was changed."
+					break
+					;;
+				2)
+					if [ "$mec_type" = listener ]; then
+						if remove_managed_listener "$mec_file" "$mec_name" "$mec_detail"; then
+							unset mec_inventory mec_total mec_choice mec_line mec_old_ifs \
+								mec_type mec_file mec_name mec_detail mec_action
+							return 0
+						fi
+					else
+						if remove_managed_upstream "$mec_file" "$mec_name" "$mec_detail"; then
+							unset mec_inventory mec_total mec_choice mec_line mec_old_ifs \
+								mec_type mec_file mec_name mec_detail mec_action
+							return 0
+						fi
+					fi
+					log_warn "No managed configuration was removed."
+					break
+					;;
+				3)
+					break
+					;;
+				*)
+					log_warn "Enter 1, 2, or 3."
+					;;
+			esac
+		done
+
+		unset mec_choice mec_line mec_old_ifs mec_type mec_file mec_name \
+			mec_detail mec_action
+	done
+}
+
+add_new_configuration() {
+	printf '\n\033[1mAdd new configuration\033[0m\n'
+	printf '  1) Public ports 80 and 443 with domain and SNI routing\n'
+	printf '  2) Isolated custom HTTP and HTTPS ports\n'
+
+	while :; do
+		printf 'Select the new configuration type [1-2]: '
+		if ! IFS= read -r anc_choice; then
+			fatal "Input ended before a new configuration type was selected."
+		fi
+
+		case $anc_choice in
+			1)
+				configure_domain_mode
+				unset anc_choice
+				return 0
+				;;
+			2)
+				write_redirect_80
+				configure_custom_port_mode
+				unset anc_choice
+				return 0
+				;;
+			*)
+				log_warn "Enter 1 or 2."
+				;;
+		esac
+	done
+}
+
+choose_next_action() {
+	if [ "${MANAGED_EXISTING:-0}" -ne 1 ] \
+		|| ! has_managed_configurations; then
+		if [ "${MANAGED_EXISTING:-0}" -eq 1 ]; then
+			log_warn "Management state exists, but no script-managed listener or upstream configuration files were found."
+		fi
+		add_new_configuration
+		return 0
+	fi
+
+	while :; do
+		printf 'Choose what to do next: 1) Manage existing configurations — select a listener, server, or upstream shown above to modify its port or remove that node; 2) Add new configuration — create a new public 80/443 or custom-port setup without changing an existing node.\n\n'
+		printf 'Select an action [1-2]: '
+		if ! IFS= read -r cna_choice; then
+			fatal "Input ended before the next action was selected."
+		fi
+
+		case $cna_choice in
+			1)
+				manage_existing_confs
+				cna_status=$?
+				if [ "$cna_status" -eq 0 ]; then
+					unset cna_choice cna_status
+					return 0
+				fi
+				unset cna_status
+				printf '\n'
+				;;
+			2)
+				add_new_configuration
+				unset cna_choice
+				return 0
+				;;
+			*)
+				log_warn "Enter 1 or 2."
+				;;
+		esac
+	done
+}
+
+test_nginx_conf() {
 	log_info "Testing the complete Nginx configuration..."
 
 	if tnc_output=$("$NGINX_BIN" -t -c "$NGINX_MAIN_CONF" 2>&1); then
@@ -2752,8 +3536,18 @@ restart_nginx() {
 
 print_summary() {
 	printf '\n\033[1mConfiguration summary\033[0m\n'
+
+	if [ "${MODE:-}" = manage ]; then
+		printf '  Mode:                 Manage existing configurations\n'
+		printf '  Action:               %s\n' "$MANAGED_NODE_ACTION"
+		printf '  Managed node:         %s\n' "$MANAGED_NODE_DESCRIPTION"
+		printf '  Transaction backups: %s\n\n' "$BACKUP_DIR"
+		unset MODE MANAGED_NODE_ACTION MANAGED_NODE_DESCRIPTION
+		return 0
+	fi
+
 	printf '  Mode:                 %s\n' "$MODE"
-	printf '  Hostname:             %s\n' "$DOMAIN"
+	printf '  domain:             %s\n' "$DOMAIN"
 
 	if [ "${TLS_PASSTHROUGH:-0}" -eq 1 ]; then
 		printf '  TLS handling:         Raw TLS passthrough\n'
@@ -2834,19 +3628,10 @@ main() {
 	fi
 
 	display_inventory
-
-	printf 'Enable domain-based public routing on ports 80 and 443?\n'
-	printf 'Choose no to create an isolated custom-port HTTP/HTTPS setup instead.\n'
-
-	if confirm "Use public 80/443 domain and SNI routing?" yes; then
-		configure_domain_mode
-	else
-		write_redirect_80
-		configure_custom_port_mode
-	fi
+	choose_next_action
 
 	write_management_state
-	test_nginx_configuration
+	test_nginx_conf
 	restart_nginx
 
 	TRANSACTION_ACTIVE=0
@@ -2858,7 +3643,8 @@ main() {
 		PORT_CHECKER NGINX_CONF_DIR NGINX_MAIN_CONF NGINX_BIN \
 		IPV6_ENABLED IPV6_LISTEN_PREFIX STATE_FILE MANAGED_EXISTING \
 		MANAGED_INSTALLED_AT MANAGED_LAST_CONFIGURED_AT TLS_PASSTHROUGH \
-		HTTP_REDIRECT_CONFIG REDIRECT_SNIPPET
+		HTTP_REDIRECT_CONFIG REDIRECT_SNIPPET MANAGED_NODE_ACTION \
+		MANAGED_NODE_DESCRIPTION MANAGED_NEW_PORT
 
 	log_success "Nginx reverse-proxy configuration completed."
 }

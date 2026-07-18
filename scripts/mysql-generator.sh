@@ -396,10 +396,10 @@ port_is_in_use() {
 }
 
 prompt_installation_ports() {
-	printf '%s' 'phpMyAdmin Port: ' >&2
+	printf '%s' 'phpMyAdmin port: ' >&2
 	IFS= read -r PHPMYADMIN_PORT || fail 'Input ended unexpectedly.'
 
-	printf '%s' 'MariaDB Port [3306]: ' >&2
+	printf '%s' 'MariaDB port[3306]: ' >&2
 	IFS= read -r MARIADB_PORT || fail 'Input ended unexpectedly.'
 	MARIADB_PORT=${MARIADB_PORT:-3306}
 
@@ -418,15 +418,15 @@ prompt_installation_ports() {
 		|| fail 'MARIADB_PORT must be an integer from 1 to 65535.'
 
 	if port_is_in_use "$PHPMYADMIN_PORT"; then
-		warn "PHPMYADMIN_PORT $PHPMYADMIN_PORT is currently in use."
+		warn "phpMyAdmin Port $PHPMYADMIN_PORT is currently in use."
 	else
-		info "PHPMYADMIN_PORT $PHPMYADMIN_PORT is currently available."
+		info "phpMyAdmin Port $PHPMYADMIN_PORT is currently available."
 	fi
 
 	if port_is_in_use "$MARIADB_PORT"; then
-		warn "MARIADB_PORT $MARIADB_PORT is currently in use."
+		warn "MariaDB Port $MARIADB_PORT is currently in use."
 	else
-		info "MARIADB_PORT $MARIADB_PORT is currently available."
+		info "MariaDB Port $MARIADB_PORT is currently available."
 	fi
 }
 
@@ -446,7 +446,6 @@ write_phpmyadmin_service() {
 		Type=simple
 		User=www-data
 		Group=www-data
-		WorkingDirectory=/usr/share/phpmyadmin
 		RuntimeDirectory=phpmyadmin-local
 		RuntimeDirectoryMode=0700
 		ExecStartPre=/usr/bin/install -d -m 0700 $PHPMYADMIN_RUNTIME/tmp $PHPMYADMIN_RUNTIME/sessions
@@ -609,7 +608,7 @@ deploy() {
 		*) fail "Installed server is not MariaDB $MARIADB_RELEASE: ${MARIADB_VERSION:-unknown}" ;;
 	esac
 
-	info 'Binding MariaDB to 127.0.0.1:$MARIADB_PORT'
+	info "Binding MariaDB to 127.0.0.1:$MARIADB_PORT"
 	mkdir -p /etc/mysql/mariadb.conf.d
 	cat > "$MARIADB_BIND_CONFIG" <<- MARIADB
 		[mariadbd]
@@ -727,7 +726,7 @@ deploy() {
 
 	info 'Installation completed successfully.'
 	info "phpMyAdmin is listening only at http://$PHPMYADMIN_ADDRESS:$PHPMYADMIN_PORT/"
-	printf 'mysql://%s:%s@127.0.0.1:$MARIADB_PORT/%s\n' "$user" "$ENCODED_PASSWORD" "$app"
+	printf 'mysql://%s:%s@127.0.0.1:%s/%s\n' "$user" "$ENCODED_PASSWORD" "$MARIADB_PORT" "$app"
 }
 
 read_managed_name() {

@@ -49,8 +49,16 @@ cleanup_temp() {
 	unset CURRENT_TMP
 }
 
+cleanup_validation_dir() {
+	if [ -n "${VALIDATION_DIR:-}" ] && [ -d "$VALIDATION_DIR" ]; then
+		rm -rf "$VALIDATION_DIR" 2> /dev/null || :
+	fi
+	unset VALIDATION_DIR
+}
+
 fatal() {
 	cleanup_temp
+	cleanup_validation_dir
 	log_error "$*"
 
 	if [ "${TRANSACTION_ACTIVE:-0}" -eq 1 ] \
@@ -136,7 +144,7 @@ command_exists() {
 }
 
 reset_internal_state() {
-	unset CURRENT_TMP TRANSACTION_ACTIVE ROLLBACK_DONE BACKUP_DIR MANIFEST \
+	unset CURRENT_TMP VALIDATION_DIR TRANSACTION_ACTIVE ROLLBACK_DONE BACKUP_DIR MANIFEST \
 		PORT_CHECKER MODE DOMAIN CERT_FILE KEY_FILE HTTP_PORT HTTPS_PORT \
 		TLS_INTERNAL_PORT BACKEND_PORT TLS_PASSTHROUGH SITE_CONFIG STREAM_CONFIG \
 		HTTP_REDIRECT_CONFIG REDIRECT_SNIPPET LOCATION_FRAGMENT WS_MAP_VAR \
@@ -298,7 +306,7 @@ validate_existing_managed_runtime() {
 	select_port_checker
 }
 
-ensure_managed_support_files() {
+ensure_support_files() {
 	ems_snippet="$NGINX_CONF_DIR/snippets/redirect_443.forcessl.conf"
 	if [ ! -f "$ems_snippet" ]; then
 		log_warn "The managed HTTPS redirect snippet is missing; recreating it."
@@ -310,8 +318,8 @@ ensure_managed_support_files() {
 managed_conf_files() {
 	for mcf_file in \
 		"$NGINX_CONF_DIR/conf.d"/redirect_*.conf \
-		"$NGINX_CONF_DIR/conf.d"/reverse_proxy_*.conf \
-		"$NGINX_CONF_DIR/conf.d"/custom_proxy_*.conf \
+		"$NGINX_CONF_DIR/conf.d"/reverse_*.conf \
+		"$NGINX_CONF_DIR/conf.d"/proxy_*.conf \
 		"$NGINX_CONF_DIR/stream-conf.d"/redirect_*.conf; do
 		[ -f "$mcf_file" ] || continue
 		if grep '^[[:space:]]*# Managed' "$mcf_file" > /dev/null 2>&1; then
@@ -587,25 +595,74 @@ backup_name_for() {
 	unset bnf_target bnf_stripped
 }
 
+is_redirect_conf() {
+	irc_target=$1
+
+	case $irc_target in
+		"$NGINX_CONF_DIR"/conf.d/redirect_*.conf | \
+			"$NGINX_CONF_DIR"/stream-conf.d/redirect_*.conf)
+			unset irc_target
+			return 0
+			;;
+	esac
+
+	unset irc_target
+	return 1
+}
+
+is_script_managed_file() {
+	ismf_target=$1
+
+	if [ -f "$ismf_target" ] \
+		&& grep '^[[:space:]]*# Managed' "$ismf_target" > /dev/null 2>&1; then
+		unset ismf_target
+		return 0
+	fi
+
+	unset ismf_target
+	return 1
+}
+
+backup_existing_file() {
+	bef_target=$1
+	bef_backup=$(backup_name_for "$bef_target")
+
+	if ! cp -p -P "$bef_target" "$bef_backup"; then
+		unset bef_target bef_backup
+		return 1
+	fi
+
+	record_change O "$bef_target" "$bef_backup"
+	log_success "Rollback backup created: $bef_backup"
+	unset bef_target bef_backup
+	return 0
+}
+
 prepare_for_replace() {
 	ptr_target=$1
 
 	if [ -e "$ptr_target" ] || [ -L "$ptr_target" ]; then
-		log_warn "The file already exists: $ptr_target"
+		if is_redirect_conf "$ptr_target" \
+			&& is_script_managed_file "$ptr_target"; then
+			log_warn "Automatically replacing script-managed redirect configuration: $ptr_target"
+			log_info "No overwrite confirmation is required; a transactional rollback backup will be created automatically."
+			backup_existing_file "$ptr_target" \
+				|| fatal "Could not create the automatic rollback backup for $ptr_target."
+			unset ptr_target
+			return 0
+		fi
+
+		log_warn "The existing file is not recognized as an automatically replaceable script-managed redirect configuration: $ptr_target"
+		log_warn "Overwriting it may remove manually maintained directives or configuration blocks."
 		if ! confirm "Overwrite this file?" no; then
 			fatal "Stopped without overwriting $ptr_target."
 		fi
 
 		if confirm "Create a rollback backup first?" yes; then
-			ptr_backup=$(backup_name_for "$ptr_target")
-			if ! cp -p -P "$ptr_target" "$ptr_backup"; then
-				fatal "Could not back up $ptr_target to $ptr_backup."
-			fi
-			record_change O "$ptr_target" "$ptr_backup"
-			log_success "Backup created: $ptr_backup"
-			unset ptr_backup
+			backup_existing_file "$ptr_target" \
+				|| fatal "Could not create the rollback backup for $ptr_target."
 		else
-			log_warn "No backup will be available for $ptr_target."
+			log_warn "No rollback backup will be available for $ptr_target."
 			if ! confirm "Continue without a backup?" no; then
 				fatal "Stopped before overwriting $ptr_target."
 			fi
@@ -613,6 +670,7 @@ prepare_for_replace() {
 		fi
 	else
 		record_change N "$ptr_target" ""
+		log_info "Creating new managed configuration file: $ptr_target"
 	fi
 
 	unset ptr_target
@@ -638,6 +696,176 @@ commit_temp_file() {
 	unset CURRENT_TMP
 	log_success "Installed: $ctf_target"
 	unset ctf_target ctf_mode
+}
+
+make_validation_dir() {
+	mvd_attempt=0
+	cleanup_validation_dir
+
+	while [ "$mvd_attempt" -lt 100 ]; do
+		mvd_candidate="$BACKUP_DIR/nginx-validation.$$.$mvd_attempt"
+		if (
+			umask 077
+			mkdir "$mvd_candidate"
+		) 2> /dev/null; then
+			VALIDATION_DIR=$mvd_candidate
+			unset mvd_attempt mvd_candidate
+			return 0
+		fi
+		mvd_attempt=$((mvd_attempt + 1))
+	done
+
+	unset mvd_attempt mvd_candidate
+	return 1
+}
+
+copy_validation_tree() {
+	cvt_item=
+	cvt_base=
+
+	for cvt_item in \
+		"$NGINX_CONF_DIR"/* \
+		"$NGINX_CONF_DIR"/.[!.]* \
+		"$NGINX_CONF_DIR"/..?*; do
+		if [ ! -e "$cvt_item" ] && [ ! -L "$cvt_item" ]; then
+			continue
+		fi
+
+		cvt_base=$(basename "$cvt_item")
+		case $cvt_base in
+			backups)
+				continue
+				;;
+		esac
+
+		if [ -e "$VALIDATION_DIR/$cvt_base" ] \
+			|| [ -L "$VALIDATION_DIR/$cvt_base" ]; then
+			continue
+		fi
+
+		cp -R -P -p "$cvt_item" "$VALIDATION_DIR/" \
+			|| {
+				unset cvt_item cvt_base
+				return 1
+			}
+	done
+
+	unset cvt_item cvt_base
+	return 0
+}
+
+validate_nginx_candidate() {
+	vnc_target=$1
+	vnc_candidate=$2
+
+	case $vnc_target in
+		"$NGINX_CONF_DIR"/*)
+			vnc_relative=${vnc_target#"$NGINX_CONF_DIR"/}
+			;;
+		*)
+			log_error "Cannot validate a generated Nginx file outside $NGINX_CONF_DIR: $vnc_target"
+			unset vnc_target vnc_candidate
+			return 1
+			;;
+	esac
+
+	if ! make_validation_dir; then
+		log_error "Could not create an isolated Nginx validation directory."
+		unset vnc_target vnc_candidate vnc_relative
+		return 1
+	fi
+
+	log_info "Building an isolated validation copy for $vnc_target"
+	if ! copy_validation_tree; then
+		log_error "Could not copy the current Nginx configuration into the validation directory."
+		cleanup_validation_dir
+		unset vnc_target vnc_candidate vnc_relative
+		return 1
+	fi
+
+	vnc_shadow_target="$VALIDATION_DIR/$vnc_relative"
+	vnc_shadow_dir=$(dirname "$vnc_shadow_target")
+	mkdir -p "$vnc_shadow_dir" \
+		|| {
+			log_error "Could not prepare the candidate validation path: $vnc_shadow_dir"
+			cleanup_validation_dir
+			unset vnc_target vnc_candidate vnc_relative \
+				vnc_shadow_target vnc_shadow_dir
+			return 1
+		}
+
+	rm -f "$vnc_shadow_target" \
+		|| {
+			log_error "Could not replace the shadow copy of the validation target."
+			cleanup_validation_dir
+			unset vnc_target vnc_candidate vnc_relative \
+				vnc_shadow_target vnc_shadow_dir
+			return 1
+		}
+
+	cp -p "$vnc_candidate" "$vnc_shadow_target" \
+		|| {
+			log_error "Could not copy the generated candidate into the validation tree."
+			cleanup_validation_dir
+			unset vnc_target vnc_candidate vnc_relative \
+				vnc_shadow_target vnc_shadow_dir
+			return 1
+		}
+
+	vnc_test_main="$VALIDATION_DIR/nginx-manager-validation.conf"
+	if ! awk -v source="$NGINX_CONF_DIR" -v replacement="$VALIDATION_DIR" '
+		{
+			line = $0
+			result = ""
+			while ((position = index(line, source)) != 0) {
+				result = result substr(line, 1, position - 1) replacement
+				line = substr(line, position + length(source))
+			}
+			print result line
+		}
+	' "$NGINX_MAIN_CONF" > "$vnc_test_main"; then
+		log_error "Could not generate the isolated validation entry point."
+		cleanup_validation_dir
+		unset vnc_target vnc_candidate vnc_relative \
+			vnc_shadow_target vnc_shadow_dir vnc_test_main
+		return 1
+	fi
+
+	vnc_output="$VALIDATION_DIR/nginx-test-output.txt"
+	log_info "Running nginx -t against the generated candidate before installation..."
+	if "$NGINX_BIN" -t -c "$vnc_test_main" > "$vnc_output" 2>&1; then
+		cat "$vnc_output"
+		log_success "Candidate validation passed: $vnc_target"
+		cleanup_validation_dir
+		unset vnc_target vnc_candidate vnc_relative \
+			vnc_shadow_target vnc_shadow_dir vnc_test_main vnc_output
+		return 0
+	fi
+
+	cat "$vnc_output" >&2
+	log_error "Candidate validation failed; the live target was not modified: $vnc_target"
+	cleanup_validation_dir
+	unset vnc_target vnc_candidate vnc_relative \
+		vnc_shadow_target vnc_shadow_dir vnc_test_main vnc_output
+	return 1
+}
+
+commit_nginx_file() {
+	cvnf_target=$1
+	cvnf_mode=$2
+
+	[ -n "${CURRENT_TMP:-}" ] \
+		|| fatal "Internal error: no generated Nginx candidate is ready for $cvnf_target."
+
+	if ! validate_nginx_candidate "$cvnf_target" "$CURRENT_TMP"; then
+		cleanup_temp
+		unset cvnf_target cvnf_mode
+		return 1
+	fi
+
+	commit_temp_file "$cvnf_target" "$cvnf_mode"
+	unset cvnf_target cvnf_mode
+	return 0
 }
 
 rollback_transaction() {
@@ -692,6 +920,7 @@ handle_signal() {
 	printf '\n' >&2
 	log_error "Interrupted."
 	cleanup_temp
+	cleanup_validation_dir
 	rollback_transaction
 	exit 130
 }
@@ -818,7 +1047,8 @@ write_redirect_80() {
 		}
 	REDIRECT_80
 
-	commit_temp_file "$wbr_target" 0644
+	commit_nginx_file "$wbr_target" 0644 \
+		|| fatal "The generated public HTTP redirect configuration failed validation."
 	unset wbr_target
 }
 
@@ -1540,7 +1770,8 @@ write_domain_redirect_80() {
 		}
 	DOMAIN_REDIRECT_80
 
-	commit_temp_file "$wdr_target" 0644
+	commit_nginx_file "$wdr_target" 0644 \
+		|| fatal "The generated domain redirect configuration failed validation."
 	HTTP_REDIRECT_CONFIG=$wdr_target
 	unset wdr_target
 }
@@ -1575,7 +1806,8 @@ write_custom_redirect_config() {
 		}
 	CUSTOM_REDIRECT
 
-	commit_temp_file "$wcrc_target" 0644
+	commit_nginx_file "$wcrc_target" 0644 \
+		|| fatal "The generated custom-port redirect configuration failed validation."
 	HTTP_REDIRECT_CONFIG=$wcrc_target
 	unset wcrc_target
 }
@@ -1626,7 +1858,8 @@ write_stream_sni_config() {
 		}
 	STREAM_CONF
 
-	commit_temp_file "$wssc_target" 0644
+	commit_nginx_file "$wssc_target" 0644 \
+		|| fatal "The generated TLS stream configuration failed validation."
 	STREAM_CONFIG=$wssc_target
 	unset wssc_public_port wssc_target wssc_upstream wssc_map_variable \
 		wssc_reject_upstream wssc_backend_port wssc_description
@@ -1635,23 +1868,13 @@ write_stream_sni_config() {
 validate_location_path() {
 	vlp_candidate=$1
 
-	case $vlp_candidate in
-		/*) ;;
-		*)
-			unset vlp_candidate
-			return 1
-			;;
-	esac
-
-	case $vlp_candidate in
-		*[!A-Za-z0-9_./~+%-]* | *//* | */../* | */.. | ../* | ..)
-			unset vlp_candidate
-			return 1
-			;;
-	esac
+	if [ -n "$vlp_candidate" ]; then
+		unset vlp_candidate
+		return 0
+	fi
 
 	unset vlp_candidate
-	return 0
+	return 1
 }
 
 validate_proxy_url() {
@@ -1782,6 +2005,53 @@ append_common_proxy_headers() {
 	unset acph_fragment acph_forwarded_port acph_timeout
 }
 
+collect_custom_parameters() {
+	ccp_output=$1
+
+	while :; do
+		: > "$ccp_output" \
+			|| fatal "Could not create the custom-parameter workspace."
+		chmod 0600 "$ccp_output" \
+			|| fatal "Could not secure the custom-parameter workspace."
+
+		printf '\nPaste raw Nginx directives exactly as they should appear inside the location block.\n'
+		printf 'Single-line semicolon-separated and multi-line formats are both supported.\n'
+		printf 'Examples:\n'
+		printf '  proxy_pass http://api_backend; proxy_set_header Host $http_host;\n'
+		printf '  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n'
+		printf 'Enter END on a line by itself when finished.\n\n'
+
+		ccp_lines=0
+		while :; do
+			if ! IFS= read -r ccp_line; then
+				fatal "Input ended before the custom Nginx directives were completed with END."
+			fi
+
+			if [ "$ccp_line" = END ]; then
+				break
+			fi
+
+			printf '%s\n' "$ccp_line" >> "$ccp_output" \
+				|| fatal "Could not save the custom Nginx directives."
+			ccp_lines=$((ccp_lines + 1))
+		done
+
+		if [ "$ccp_lines" -gt 0 ] \
+			&& grep '[^[:space:]]' "$ccp_output" > /dev/null 2>&1; then
+			if [ "$ccp_lines" -eq 1 ]; then
+				log_success "Captured one custom directive line; semicolon-separated directives will be parsed directly by Nginx."
+			else
+				log_success "Captured $ccp_lines custom directive lines for Nginx validation."
+			fi
+			unset ccp_output ccp_lines ccp_line
+			return 0
+		fi
+
+		log_warn "At least one non-empty Nginx directive is required. Enter the directives again."
+		unset ccp_lines ccp_line
+	done
+}
+
 collect_custom_locations() {
 	ccl_forwarded_port=$1
 	LOCATION_FRAGMENT="$BACKUP_DIR/location-blocks.conf"
@@ -1793,25 +2063,27 @@ collect_custom_locations() {
 	printf '\n\033[1mCustom location examples:\033[0m\n'
 	printf '  Static files: location / { root /var/www/site; try_files $uri $uri/ =404; }\n'
 	printf '  HTTP proxy:   location /api/ { proxy_pass http://127.0.0.1:3001; ... }\n'
-	printf '  WebSocket:    location /ws/ { proxy_pass http://127.0.0.1:3002; Upgrade headers... }\n\n'
+	printf '  WebSocket:    location /ws/ { proxy_pass http://127.0.0.1:3002; Upgrade headers... }\n'
+	printf '  Regex match:  location ~ ^/(api) { ... }\n'
+	printf '  PHP regex:    location ~* \.php$ { ... }\n\n'
 
 	ccl_count=0
 
 	while :; do
 		while :; do
-			printf 'Location path (for example /, /api/, or /ws/): '
+			printf 'Location match after the location keyword (for example /, ~ ^/(api), or ~* \.php$): '
 			if ! IFS= read -r ccl_path; then
 				fatal "Input ended while collecting location blocks."
 			fi
 
 			if ! validate_location_path "$ccl_path"; then
-				log_warn "Use a safe URI-prefix location beginning with /; regex modifiers and Nginx control characters are rejected."
+				log_warn "The location match cannot be empty. Prefix, exact, named, regex, and other Nginx-supported location forms are accepted and will be checked by nginx -t."
 				continue
 			fi
 
 			if grep -F "# LOCATION: $ccl_path" "$LOCATION_FRAGMENT" \
 				> /dev/null 2>&1; then
-				log_warn "That location path has already been configured."
+				log_warn "That exact location match has already been configured."
 				continue
 			fi
 			break
@@ -1821,18 +2093,19 @@ collect_custom_locations() {
 		printf '  1) Static files\n'
 		printf '  2) Standard HTTP/HTTPS reverse proxy\n'
 		printf '  3) WebSocket reverse proxy\n'
+		printf '  4) Custom parameters\n'
 
 		while :; do
-			printf 'Choice [1-3]: '
+			printf 'Choice [1-4]: '
 			if ! IFS= read -r ccl_type; then
 				fatal "Input ended while selecting a location type."
 			fi
 			case $ccl_type in
-				1 | 2 | 3)
+				1 | 2 | 3 | 4)
 					break
 					;;
 				*)
-					log_warn "Enter 1, 2, or 3."
+					log_warn "Enter 1, 2, 3, or 4."
 					;;
 			esac
 		done
@@ -1913,9 +2186,23 @@ collect_custom_locations() {
 				printf '    }\n' >> "$LOCATION_FRAGMENT"
 				unset ccl_upstream
 				;;
+			4)
+				ccl_custom_parameters="$BACKUP_DIR/custom-location-parameters.conf"
+				collect_custom_parameters "$ccl_custom_parameters"
+
+				printf '    location %s {\n' "$ccl_path" >> "$LOCATION_FRAGMENT"
+				sed 's/^/        /' "$ccl_custom_parameters" \
+					>> "$LOCATION_FRAGMENT" \
+					|| fatal "Could not append the custom Nginx directives."
+				printf '    }\n' >> "$LOCATION_FRAGMENT"
+				rm -f "$ccl_custom_parameters"
+				log_success "Custom parameters added for location $ccl_path; the complete candidate will now be checked by nginx -t."
+				unset ccl_custom_parameters
+				;;
 		esac
 
 		ccl_count=$((ccl_count + 1))
+		log_success "Added location block: location $ccl_path"
 		unset ccl_path ccl_type
 
 		if ! confirm "Add another location block?" no; then
@@ -1954,7 +2241,7 @@ choose_proxy_layout() {
 
 	printf '\nSelect how this HTTPS virtual host should serve traffic:\n'
 	printf '  1) Proxy every request to one manually selected backend port\n'
-	printf '  2) Build custom static/proxy/WebSocket location blocks interactively\n'
+	printf '  2) Build custom static/proxy/WebSocket/custom-parameter location blocks interactively\n'
 
 	while :; do
 		printf 'Choice [1]: '
@@ -2063,9 +2350,82 @@ write_https_site_config() {
 		|| fatal "Could not append location blocks to $whsc_target."
 	printf '}\n' >> "$CURRENT_TMP"
 
-	commit_temp_file "$whsc_target" 0644
+	if ! commit_nginx_file "$whsc_target" 0644; then
+		unset whsc_listen whsc_target
+		return 1
+	fi
+
 	SITE_CONFIG=$whsc_target
 	unset whsc_listen whsc_target
+	return 0
+}
+
+write_custom_config() {
+	wcmc_target=$1
+	make_temp_for "$wcmc_target"
+
+	cat > "$CURRENT_TMP" <<- CUSTOM_CONFIG
+		# Managed custom-port HTTP/HTTPS reverse proxy for $DOMAIN.
+		# This file does not alter public port-80 or port-443 routing.
+
+		map \$http_upgrade \$$WS_MAP_VAR {
+		    default upgrade;
+		    '' close;
+		}
+
+		server {
+		    listen $HTTP_PORT;
+		    ${IPV6_LISTEN_PREFIX}listen [::]:$HTTP_PORT;
+		    server_name $DOMAIN;
+
+		    if (\$host != "$DOMAIN") {
+		        return 444;
+		    }
+
+		    server_tokens off;
+		    return 301 https://\$host:$HTTPS_PORT\$request_uri;
+		}
+
+		server {
+		    listen $HTTPS_PORT ssl;
+		    ${IPV6_LISTEN_PREFIX}listen [::]:$HTTPS_PORT ssl;
+		    server_name $DOMAIN;
+
+		    if (\$host != "$DOMAIN") {
+		        return 444;
+		    }
+
+		    server_tokens off;
+
+		    ssl_certificate $CERT_FILE;
+		    ssl_certificate_key $KEY_FILE;
+		    ssl_protocols TLSv1.2 TLSv1.3;
+		    ssl_session_timeout 1d;
+		    ssl_session_cache shared:SSL:10m;
+		    ssl_session_tickets off;
+
+		    client_max_body_size 16m;
+		    keepalive_timeout 65s;
+
+		    add_header Strict-Transport-Security "max-age=31536000" always;
+		    add_header X-Content-Type-Options "nosniff" always;
+		    add_header X-Frame-Options "SAMEORIGIN" always;
+		    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+	CUSTOM_CONFIG
+
+	cat "$LOCATION_FRAGMENT" >> "$CURRENT_TMP" \
+		|| fatal "Could not append custom location blocks."
+	printf '}\n' >> "$CURRENT_TMP"
+
+	if ! commit_nginx_file "$wcmc_target" 0644; then
+		unset wcmc_target
+		return 1
+	fi
+
+	SITE_CONFIG=$wcmc_target
+	unset wcmc_target
+	return 0
 }
 
 configure_domain_mode() {
@@ -2097,9 +2457,18 @@ configure_domain_mode() {
 
 	if [ "$TLS_PASSTHROUGH" -eq 0 ]; then
 		cdm_token=$(bounded_domain_token "$DOMAIN" 80)
-		cdm_target="$NGINX_CONF_DIR/conf.d/reverse_proxy_${cdm_token}.conf"
+		cdm_target="$NGINX_CONF_DIR/conf.d/reverse_${cdm_token}.conf"
 		cdm_listen="listen 127.0.0.1:$TLS_INTERNAL_PORT ssl;"
-		write_https_site_config "$cdm_listen" "$cdm_target"
+
+		while ! write_https_site_config "$cdm_listen" "$cdm_target"; do
+			log_warn "The HTTPS virtual-host candidate was rejected by nginx -t."
+			if ! confirm "Re-enter the proxy layout and location parameters?" yes; then
+				fatal "Stopped without installing an invalid HTTPS virtual-host configuration."
+			fi
+			choose_proxy_layout 443
+		done
+
+		log_success "The HTTPS virtual-host configuration passed validation and was installed."
 		unset cdm_token cdm_target cdm_listen
 	fi
 
@@ -2137,66 +2506,17 @@ configure_custom_port_mode() {
 		choose_proxy_layout "$HTTPS_PORT"
 
 		ccpm_token=$(bounded_domain_token "$DOMAIN" 72)
-		ccpm_target="$NGINX_CONF_DIR/conf.d/custom_proxy_${ccpm_token}_${HTTP_PORT}_${HTTPS_PORT}.conf"
-		make_temp_for "$ccpm_target"
+		ccpm_target="$NGINX_CONF_DIR/conf.d/proxy_${ccpm_token}_${HTTP_PORT}_${HTTPS_PORT}.conf"
 
-		cat > "$CURRENT_TMP" <<- CUSTOM_CONFIG
-			# Managed custom-port HTTP/HTTPS reverse proxy for $DOMAIN.
-			# This file does not alter public port-80 or port-443 routing.
+		while ! write_custom_config "$ccpm_target"; do
+			log_warn "The custom-port HTTP/HTTPS candidate was rejected by nginx -t."
+			if ! confirm "Re-enter the proxy layout and location parameters?" yes; then
+				fatal "Stopped without installing an invalid custom-port configuration."
+			fi
+			choose_proxy_layout "$HTTPS_PORT"
+		done
 
-			map \$http_upgrade \$$WS_MAP_VAR {
-			    default upgrade;
-			    '' close;
-			}
-
-			server {
-			    listen $HTTP_PORT;
-			    ${IPV6_LISTEN_PREFIX}listen [::]:$HTTP_PORT;
-			    server_name $DOMAIN;
-
-			    if (\$host != "$DOMAIN") {
-			        return 444;
-			    }
-
-			    server_tokens off;
-			    return 301 https://\$host:$HTTPS_PORT\$request_uri;
-			}
-
-			server {
-			    listen $HTTPS_PORT ssl;
-			    ${IPV6_LISTEN_PREFIX}listen [::]:$HTTPS_PORT ssl;
-			    server_name $DOMAIN;
-
-			    if (\$host != "$DOMAIN") {
-			        return 444;
-			    }
-
-			    server_tokens off;
-
-			    ssl_certificate $CERT_FILE;
-			    ssl_certificate_key $KEY_FILE;
-			    ssl_protocols TLSv1.2 TLSv1.3;
-			    ssl_session_timeout 1d;
-			    ssl_session_cache shared:SSL:10m;
-			    ssl_session_tickets off;
-
-			    client_max_body_size 16m;
-			    keepalive_timeout 65s;
-
-			    add_header Strict-Transport-Security "max-age=31536000" always;
-			    add_header X-Content-Type-Options "nosniff" always;
-			    add_header X-Frame-Options "SAMEORIGIN" always;
-			    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
-
-		CUSTOM_CONFIG
-
-		cat "$LOCATION_FRAGMENT" >> "$CURRENT_TMP" \
-			|| fatal "Could not append custom location blocks."
-		printf '}\n' >> "$CURRENT_TMP"
-
-		commit_temp_file "$ccpm_target" 0644
-		SITE_CONFIG=$ccpm_target
-
+		log_success "The custom-port HTTP/HTTPS configuration passed validation and was installed."
 		unset ccpm_token ccpm_target WS_MAP_VAR LOCATION_FRAGMENT
 	else
 		TLS_PASSTHROUGH=1
@@ -2345,7 +2665,7 @@ main() {
 		validate_existing_managed_runtime
 		ensure_directories
 		init_transaction
-		ensure_managed_support_files
+		ensure_support_files
 	else
 		MANAGED_EXISTING=0
 		prompt_ipv6_support
@@ -2384,6 +2704,7 @@ main() {
 
 	TRANSACTION_ACTIVE=0
 	cleanup_temp
+	cleanup_validation_dir
 	print_summary
 
 	unset TRANSACTION_ACTIVE ROLLBACK_DONE MANIFEST BACKUP_DIR \

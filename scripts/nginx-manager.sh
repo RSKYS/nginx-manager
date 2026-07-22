@@ -151,7 +151,7 @@ reset_internal_state() {
 		WS_MAP_VAR PROMPTED_FILE PROMPTED_PORT SELECTED_FREE_PORT IPV6_ENABLED \
 		IPV6_LISTEN_PREFIX STATE_FILE MANAGED_EXISTING MANAGED_INSTALLED_AT \
 		MANAGED_LAST_CONFIGURED_AT MANAGED_NODE_ACTION MANAGED_NODE_DESCRIPTION \
-		MANAGED_NEW_PORT
+		MANAGED_NEW_PORT BODY_SIZE_MB
 }
 
 initialize_runtime_paths() {
@@ -323,7 +323,7 @@ managed_conf_files() {
 		"$NGINX_CONF_DIR/conf.d"/proxy_*.conf \
 		"$NGINX_CONF_DIR/stream-conf.d"/redirect_*.conf; do
 		[ -f "$mcf_file" ] || continue
-		if grep '^[[:space:]]*# Managed' "$mcf_file" > /dev/null 2>&1; then
+		if is_script_managed_file "$mcf_file"; then
 			printf '%s\n' "$mcf_file"
 		fi
 	done
@@ -614,8 +614,16 @@ is_redirect_conf() {
 is_script_managed_file() {
 	ismf_target=$1
 
-	if [ -f "$ismf_target" ] \
-		&& grep '^[[:space:]]*# Managed' "$ismf_target" > /dev/null 2>&1; then
+	[ -f "$ismf_target" ] || {
+		unset ismf_target
+		return 1
+	}
+
+	# Accept the marker used by older releases and the exact primary headers
+	# emitted by current generators. Inventory, replacement, merging, editing,
+	# and removal must all use the same recognition policy.
+	if grep -E '^[[:space:]]*# ([Mm]anaged|nginx-manager: (Public HTTP catch-all|Custom-port HTTP redirect|Public TLS/SNI gateway|HTTPS reverse-proxy virtual host|Custom-port HTTP/HTTPS reverse proxy))' \
+		"$ismf_target" > /dev/null 2>&1; then
 		unset ismf_target
 		return 0
 	fi
@@ -1092,13 +1100,13 @@ write_forced_ssl_snippet() {
 
 	if [ "$wfss_https_port" -eq 443 ]; then
 		cat > "$CURRENT_TMP" <<- SNIPPET
-			# Managed reusable HTTP-to-HTTPS redirect for public domain listeners.
+			# nginx-manager: Reusable HTTP-to-HTTPS redirect for public domain listeners.
 			# Include only from an HTTP server block with a strict server_name.
 			return 301 https://\$host\$request_uri;
 		SNIPPET
 	else
 		cat > "$CURRENT_TMP" <<- SNIPPET
-			# Managed reusable HTTP-to-HTTPS redirect for custom port $wfss_https_port.
+			# nginx-manager: Reusable HTTP-to-HTTPS redirect for custom port $wfss_https_port.
 			# Include only from an HTTP server block with a strict server_name.
 			return 301 https://\$host:$wfss_https_port\$request_uri;
 		SNIPPET
@@ -1119,15 +1127,15 @@ write_redirect_80() {
 	make_temp_for "$wbr_target"
 
 	cat > "$CURRENT_TMP" <<- REDIRECT_80
-		# Managed public HTTP catch-all.
+		# nginx-manager: Public HTTP catch-all.
 		# Unknown Host headers are closed without returning content.
 		server {
-			listen 80 default_server;
-			${IPV6_LISTEN_PREFIX}listen [::]:80 default_server;
-			server_name _;
+		    listen 80 default_server;
+		    ${IPV6_LISTEN_PREFIX}listen [::]:80 default_server;
+		    server_name _;
 
-			server_tokens off;
-			return 444;
+		    server_tokens off;
+		    return 444;
 		}
 	REDIRECT_80
 
@@ -1537,6 +1545,30 @@ select_certificate_paths() {
 	unset scp_found scp_pair scp_cert scp_key
 }
 
+bootstrap_certificate_pair() {
+	ubcp_certificate="$NGINX_CONF_DIR/certs/cert.pem"
+	ubcp_private_key="$NGINX_CONF_DIR/certs/cert.key"
+
+	if [ ! -f "$ubcp_certificate" ] || [ ! -f "$ubcp_private_key" ]; then
+		log_warn "The local bootstrap certificate pair is missing; generating it now."
+		bootstrap_certificates
+	fi
+
+	[ -f "$ubcp_certificate" ] && [ -r "$ubcp_certificate" ] \
+		|| fatal "The bootstrap certificate is unavailable or unreadable: $ubcp_certificate"
+	[ -f "$ubcp_private_key" ] && [ -r "$ubcp_private_key" ] \
+		|| fatal "The bootstrap private key is unavailable or unreadable: $ubcp_private_key"
+
+	CERT_FILE=$ubcp_certificate
+	KEY_FILE=$ubcp_private_key
+
+	log_success "Using the automatically generated bootstrap certificate: $CERT_FILE"
+	log_success "Using the automatically generated bootstrap private key: $KEY_FILE"
+	log_warn "This local bootstrap certificate is self-signed. Replace it with a trusted certificate before exposing the HTTPS node to untrusted clients."
+
+	unset ubcp_certificate ubcp_private_key
+}
+
 validate_certificate_pair() {
 	if ! command_exists openssl; then
 		log_warn "OpenSSL is unavailable; certificate structure and key matching will be checked later by nginx -t."
@@ -1675,6 +1707,60 @@ prompt_port() {
 	done
 }
 
+client_max_body_size() {
+	pcmbs_https_port=$1
+	unset BODY_SIZE_MB
+
+	while :; do
+		printf '\nThis will control the maximum allowed size of the client request body; important for large file uploads or JSON payloads.\n'
+		printf '%s' 'Do you want to set a custom max body size for this node? [y/N]:'
+
+		if ! IFS= read -r pcmbs_answer; then
+			printf '\n'
+			unset pcmbs_https_port pcmbs_answer
+			return 0
+		fi
+
+		case $pcmbs_answer in
+			'' | n | N)
+				unset pcmbs_https_port pcmbs_answer
+				return 0
+				;;
+			y | Y | yes)
+				break
+				;;
+			*)
+				log_warn "Answer y/n?"
+				;;
+		esac
+	done
+
+	while :; do
+		printf '%s' 'What limit in MB do you want? (e.g. 100): '
+		if ! IFS= read -r pcmbs_limit; then
+			fatal "Input ended before a client_max_body_size limit was provided."
+		fi
+
+		case $pcmbs_limit in
+			'' | *[!0-9]*)
+				log_warn "Enter a positive whole number in MB using digits only."
+				continue
+				;;
+		esac
+
+		pcmbs_normalized=$(printf '%s\n' "$pcmbs_limit" | sed 's/^0*//')
+		if [ -z "$pcmbs_normalized" ]; then
+			log_warn "The limit must be greater than zero."
+			continue
+		fi
+
+		BODY_SIZE_MB=$pcmbs_normalized
+		log_success "Custom client_max_body_size selected for HTTPS port $pcmbs_https_port: ${BODY_SIZE_MB} MB"
+		unset pcmbs_https_port pcmbs_answer pcmbs_limit pcmbs_normalized
+		return 0
+	done
+}
+
 random_u32() {
 	if [ -r /dev/urandom ] && command_exists od; then
 		ru_value=$(od -An -N4 -tu4 /dev/urandom 2> /dev/null \
@@ -1760,10 +1846,19 @@ websocket_map_variable() {
 stream_upstream_name() {
 	sun_domain=$1
 	sun_public_port=$2
+	sun_backend_port=${3:-}
 	sun_safe=$(printf '%s' "$sun_domain" | sed 's/[.-]/_/g')
 	sun_prefix=$(printf '%s' "$sun_safe" | cut -c '1-36')
-	printf 'sni_%s_%s\n' "$sun_public_port" "$sun_prefix"
-	unset sun_domain sun_public_port sun_safe sun_prefix
+
+	if [ "$sun_public_port" -eq 443 ]; then
+		validate_port "$sun_backend_port" \
+			|| fatal "Internal error: a valid logical backend port is required for the public 443 SNI upstream name."
+		printf 'sni_%s_443_%s\n' "$sun_backend_port" "$sun_prefix"
+	else
+		printf 'sni_%s_%s\n' "$sun_public_port" "$sun_prefix"
+	fi
+
+	unset sun_domain sun_public_port sun_backend_port sun_safe sun_prefix
 }
 
 ensure_stream_include() {
@@ -1820,7 +1915,7 @@ ensure_stream_include() {
 		END {
 			if (!inserted) {
 				print ""
-				print "# Managed SNI/TCP routing configuration."
+				print "# nginx-manager: SNI/TCP routing configuration."
 				print "stream {"
 				print "    include " include_path ";"
 				print "}"
@@ -1837,25 +1932,25 @@ write_domain_redirect_80() {
 	make_temp_for "$wdr_target"
 
 	cat > "$CURRENT_TMP" <<- DOMAIN_REDIRECT_80
-		# Managed public HTTP catch-all.
+		# nginx-manager: Public HTTP catch-all.
 		# Unknown Host headers are closed without returning content.
 		server {
-			listen 80 default_server;
-			${IPV6_LISTEN_PREFIX}listen [::]:80 default_server;
-			server_name _;
+		    listen 80 default_server;
+		    ${IPV6_LISTEN_PREFIX}listen [::]:80 default_server;
+		    server_name _;
 
-			server_tokens off;
-			return 444;
+		    server_tokens off;
+		    return 444;
 		}
 
 		# Public HTTP redirect for $DOMAIN.
 		server {
-			listen 80;
-			${IPV6_LISTEN_PREFIX}listen [::]:80;
-			server_name $DOMAIN;
+		    listen 80;
+		    ${IPV6_LISTEN_PREFIX}listen [::]:80;
+		    server_name $DOMAIN;
 
-			server_tokens off;
-			include $NGINX_CONF_DIR/snippets/redirect_443.forcessl.conf;
+		    server_tokens off;
+		    include $NGINX_CONF_DIR/snippets/redirect_443.forcessl.conf;
 		}
 	DOMAIN_REDIRECT_80
 
@@ -1870,28 +1965,28 @@ write_custom_redirect_config() {
 	make_temp_for "$wcrc_target"
 
 	cat > "$CURRENT_TMP" <<- CUSTOM_REDIRECT
-		# Managed custom-port HTTP redirect for $DOMAIN.
+		# nginx-manager: Custom-port HTTP redirect for $DOMAIN.
 		# Unknown Host headers on port $HTTP_PORT are closed without content.
 		server {
-			listen $HTTP_PORT default_server;
-			${IPV6_LISTEN_PREFIX}listen [::]:$HTTP_PORT default_server;
-			server_name _;
+		    listen $HTTP_PORT default_server;
+		    ${IPV6_LISTEN_PREFIX}listen [::]:$HTTP_PORT default_server;
+		    server_name _;
 
-			server_tokens off;
-			return 444;
+		    server_tokens off;
+		    return 444;
 		}
 
 		server {
-			listen $HTTP_PORT;
-			${IPV6_LISTEN_PREFIX}listen [::]:$HTTP_PORT;
-			server_name $DOMAIN;
+		    listen $HTTP_PORT;
+		    ${IPV6_LISTEN_PREFIX}listen [::]:$HTTP_PORT;
+		    server_name $DOMAIN;
 
-			if (\$host != "$DOMAIN") {
-				return 444;
-			}
+		    if (\$host != "$DOMAIN") {
+		        return 444;
+		    }
 
-			server_tokens off;
-			include $REDIRECT_SNIPPET;
+		    server_tokens off;
+		    include $REDIRECT_SNIPPET;
 		}
 	CUSTOM_REDIRECT
 
@@ -1974,13 +2069,15 @@ merge_stream_sni_candidate() {
 	mssc_backend_port=$4
 	mssc_map_variable=$5
 	mssc_reject_upstream=$6
-	mssc_output=$7
+	mssc_existing_upstream=$7
+	mssc_output=$8
 
 	awk -v wanted_domain="$mssc_domain" \
 		-v wanted_upstream="$mssc_upstream" \
 		-v wanted_backend_port="$mssc_backend_port" \
 		-v wanted_map_variable="$mssc_map_variable" \
-		-v reject_upstream="$mssc_reject_upstream" '
+		-v reject_upstream="$mssc_reject_upstream" \
+		-v existing_upstream="$mssc_existing_upstream" '
 		function trim(value) {
 			sub(/^[[:space:]]+/, "", value)
 			sub(/[[:space:]]+$/, "", value)
@@ -2004,6 +2101,10 @@ merge_stream_sni_candidate() {
 			print "}"
 			print ""
 		}
+		function is_route_upstream(name) {
+			return name == wanted_upstream ||
+				(existing_upstream != "" && name == existing_upstream)
+		}
 		BEGIN {
 			in_map = 0
 			map_depth = 0
@@ -2011,6 +2112,7 @@ merge_stream_sni_candidate() {
 			route_written = 0
 			skip_upstream = 0
 			upstream_depth = 0
+			emit_after_skip = 0
 			upstream_written = 0
 		}
 		{
@@ -2023,9 +2125,12 @@ merge_stream_sni_candidate() {
 				close_count = gsub(/\}/, "", closing)
 				upstream_depth += open_count - close_count
 				if (upstream_depth == 0) {
-					emit_upstream()
+					if (emit_after_skip) {
+						emit_upstream()
+						upstream_written = 1
+					}
 					skip_upstream = 0
-					upstream_written = 1
+					emit_after_skip = 0
 				}
 				next
 			}
@@ -2037,7 +2142,6 @@ merge_stream_sni_candidate() {
 				map_found = 1
 				map_depth = 0
 				print line
-
 				opening = line
 				closing = line
 				open_count = gsub(/\{/, "", opening)
@@ -2051,7 +2155,6 @@ merge_stream_sni_candidate() {
 				closing = line
 				open_count = gsub(/\{/, "", opening)
 				close_count = gsub(/\}/, "", closing)
-
 				if (map_depth + open_count - close_count == 0) {
 					if (!route_written) {
 						print "    " wanted_domain " " wanted_upstream ";"
@@ -2062,7 +2165,6 @@ merge_stream_sni_candidate() {
 					map_depth = 0
 					next
 				}
-
 				value = trim(line)
 				if (value != "" && value !~ /^#/ && value !~ /^default[[:space:]]+/) {
 					key = value
@@ -2074,27 +2176,28 @@ merge_stream_sni_candidate() {
 						next
 					}
 				}
-
 				print line
 				map_depth += open_count - close_count
 				next
 			}
 
-			if (!upstream_written &&
-				line ~ /^[[:space:]]*upstream[[:space:]]+/ &&
-				upstream_name_from_line(line) == wanted_upstream) {
+			if (line ~ /^[[:space:]]*upstream[[:space:]]+/ &&
+				is_route_upstream(upstream_name_from_line(line))) {
 				skip_upstream = 1
 				upstream_depth = 0
-
+				emit_after_skip = !upstream_written
 				opening = line
 				closing = line
 				open_count = gsub(/\{/, "", opening)
 				close_count = gsub(/\}/, "", closing)
 				upstream_depth += open_count - close_count
 				if (upstream_depth == 0) {
-					emit_upstream()
+					if (emit_after_skip) {
+						emit_upstream()
+						upstream_written = 1
+					}
 					skip_upstream = 0
-					upstream_written = 1
+					emit_after_skip = 0
 				}
 				next
 			}
@@ -2106,7 +2209,6 @@ merge_stream_sni_candidate() {
 				emit_upstream()
 				upstream_written = 1
 			}
-
 			print line
 		}
 		END {
@@ -2122,12 +2224,12 @@ merge_stream_sni_candidate() {
 	mssc_status=$?
 
 	unset mssc_source mssc_domain mssc_upstream mssc_backend_port \
-		mssc_map_variable mssc_reject_upstream mssc_output
+		mssc_map_variable mssc_reject_upstream mssc_existing_upstream \
+		mssc_output
 	if [ "$mssc_status" -eq 0 ]; then
 		unset mssc_status
 		return 0
 	fi
-
 	unset mssc_status
 	return 1
 }
@@ -2135,9 +2237,9 @@ merge_stream_sni_candidate() {
 write_stream_sni_config() {
 	wssc_public_port=${1:-443}
 	wssc_target="$NGINX_CONF_DIR/stream-conf.d/redirect_${wssc_public_port}.conf"
-	wssc_upstream=$(stream_upstream_name "$DOMAIN" "$wssc_public_port")
 	wssc_map_variable="redirect_${wssc_public_port}_tls_backend"
 	wssc_reject_upstream="redirect_${wssc_public_port}_reject"
+	wssc_existing_upstream=
 
 	if [ "${TLS_PASSTHROUGH:-0}" -eq 1 ]; then
 		wssc_backend_port=$BACKEND_PORT
@@ -2145,8 +2247,19 @@ write_stream_sni_config() {
 		wssc_backend_port=$TLS_INTERNAL_PORT
 	fi
 
+	if [ "$wssc_public_port" -eq 443 ]; then
+		if [ -n "${BACKEND_PORT:-}" ]; then
+			wssc_name_port=$BACKEND_PORT
+		else
+			wssc_name_port=$wssc_backend_port
+		fi
+	else
+		wssc_name_port=
+	fi
+	wssc_upstream=$(stream_upstream_name "$DOMAIN" "$wssc_public_port" "$wssc_name_port")
+
 	if [ -f "$wssc_target" ] && find_stream_route_upstream "$wssc_target" "$DOMAIN" "$wssc_map_variable"; then
-		wssc_upstream=$FOUND_STREAM_UPSTREAM
+		wssc_existing_upstream=$FOUND_STREAM_UPSTREAM
 		unset FOUND_STREAM_UPSTREAM
 	fi
 
@@ -2157,42 +2270,46 @@ write_stream_sni_config() {
 			cleanup_temp
 			fatal "Refusing to merge into an unmanaged TLS stream configuration: $wssc_target"
 		fi
-
 		if ! merge_stream_sni_candidate "$wssc_target" "$DOMAIN" \
 			"$wssc_upstream" "$wssc_backend_port" "$wssc_map_variable" \
-			"$wssc_reject_upstream" "$CURRENT_TMP"; then
+			"$wssc_reject_upstream" "$wssc_existing_upstream" \
+			"$CURRENT_TMP"; then
 			cleanup_temp
 			fatal "Could not safely merge $DOMAIN into the existing TLS stream configuration: $wssc_target"
 		fi
-
-		log_info "Preserving existing SNI routes in $wssc_target and updating only $DOMAIN."
+		if [ -n "$wssc_existing_upstream" ] \
+			&& [ "$wssc_existing_upstream" != "$wssc_upstream" ]; then
+			log_info "Migrating SNI upstream name for $DOMAIN from $wssc_existing_upstream to $wssc_upstream."
+		else
+			log_info "Preserving existing SNI routes in $wssc_target and updating only $DOMAIN."
+		fi
 	else
 		cat > "$CURRENT_TMP" <<- STREAM_CONF
-			# Managed public TLS/SNI gateway on port $wssc_public_port.
+			# nginx-manager: Public TLS/SNI gateway on port $wssc_public_port.
 			# Each configured SNI name is retained until its managed upstream is explicitly removed.
 
 			map \$ssl_preread_server_name \$$wssc_map_variable {
-				default $wssc_reject_upstream;
-				$DOMAIN $wssc_upstream;
+			    default $wssc_reject_upstream;
+			    $DOMAIN $wssc_upstream;
 			}
 
 			upstream $wssc_upstream {
-				server 127.0.0.1:$wssc_backend_port;
+			    server 127.0.0.1:$wssc_backend_port;
 			}
 
 			# Unknown or absent SNI is rejected through a local discard endpoint.
 			upstream $wssc_reject_upstream {
-				server 127.0.0.1:9;
+			    server 127.0.0.1:9;
 			}
 
 			server {
-				listen $wssc_public_port;
-				${IPV6_LISTEN_PREFIX}listen [::]:$wssc_public_port;
+			    listen $wssc_public_port;
+			    ${IPV6_LISTEN_PREFIX}listen [::]:$wssc_public_port;
 
-				ssl_preread on;
-				proxy_pass \$$wssc_map_variable;
-				proxy_connect_timeout 2s;
-				proxy_timeout 1h;
+			    ssl_preread on;
+			    proxy_pass \$$wssc_map_variable;
+			    proxy_connect_timeout 2s;
+			    proxy_timeout 1h;
 			}
 		STREAM_CONF
 	fi
@@ -2201,19 +2318,8 @@ write_stream_sni_config() {
 		|| fatal "The generated TLS stream configuration failed validation."
 	STREAM_CONFIG=$wssc_target
 	unset wssc_public_port wssc_target wssc_upstream wssc_map_variable \
-		wssc_reject_upstream wssc_backend_port
-}
-
-validate_location_path() {
-	vlp_candidate=$1
-
-	if [ -n "$vlp_candidate" ]; then
-		unset vlp_candidate
-		return 0
-	fi
-
-	unset vlp_candidate
-	return 1
+		wssc_reject_upstream wssc_backend_port wssc_name_port \
+		wssc_existing_upstream
 }
 
 validate_proxy_url() {
@@ -2329,16 +2435,16 @@ append_common_proxy_headers() {
 	acph_timeout=${3:-60s}
 
 	cat >> "$acph_fragment" <<- PROXY_HEADERS
-		proxy_http_version 1.1;
-		proxy_set_header Host \$http_host;
-		proxy_set_header X-Forwarded-Host \$http_host;
-		proxy_set_header X-Forwarded-Port $acph_forwarded_port;
-		proxy_set_header X-Real-IP \$remote_addr;
-		proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-		proxy_set_header X-Forwarded-Proto \$scheme;
-		proxy_connect_timeout 10s;
-		proxy_send_timeout $acph_timeout;
-		proxy_read_timeout $acph_timeout;
+		        proxy_http_version 1.1;
+		        proxy_set_header Host \$http_host;
+		        proxy_set_header X-Forwarded-Host \$http_host;
+		        proxy_set_header X-Forwarded-Port $acph_forwarded_port;
+		        proxy_set_header X-Real-IP \$remote_addr;
+		        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+		        proxy_set_header X-Forwarded-Proto \$scheme;
+		        proxy_connect_timeout 10s;
+		        proxy_send_timeout $acph_timeout;
+		        proxy_read_timeout $acph_timeout;
 	PROXY_HEADERS
 
 	unset acph_fragment acph_forwarded_port acph_timeout
@@ -2461,10 +2567,10 @@ collect_required_upstreams() {
 		done
 
 		cat >> "$UPSTREAM_FRAGMENT" <<- HTTP_UPSTREAM
-			# Managed HTTP upstream inferred from custom proxy_pass directives.
+			# nginx-manager: HTTP upstream inferred from custom proxy_pass directives.
 			# UPSTREAM: $cru_name
 			upstream $cru_name {
-				server $cru_server;
+			    server $cru_server;
 			}
 
 		HTTP_UPSTREAM
@@ -2613,12 +2719,12 @@ collect_custom_locations() {
 				esac
 
 				cat >> "$LOCATION_FRAGMENT" <<- STATIC_LOCATION
-					location $ccl_path {
-						root $ccl_static_root;
-						index $ccl_index;
-						try_files \$uri \$uri/ =404;
-						autoindex off;
-					}
+					    location $ccl_path {
+					        root $ccl_static_root;
+					        index $ccl_index;
+					        try_files \$uri \$uri/ =404;
+					        autoindex off;
+					    }
 				STATIC_LOCATION
 
 				unset ccl_static_root ccl_index
@@ -2649,10 +2755,10 @@ collect_custom_locations() {
 
 				if [ "$ccl_type" -eq 3 ]; then
 					cat >> "$LOCATION_FRAGMENT" <<- WEBSOCKET_HEADERS
-						proxy_set_header Upgrade \$http_upgrade;
-						proxy_set_header Connection \$$WS_MAP_VAR;
-						proxy_buffering off;
-						proxy_cache off;
+						        proxy_set_header Upgrade \$http_upgrade;
+						        proxy_set_header Connection \$$WS_MAP_VAR;
+						        proxy_buffering off;
+						        proxy_cache off;
 					WEBSOCKET_HEADERS
 				fi
 
@@ -2748,17 +2854,17 @@ choose_proxy_layout() {
 					|| fatal "Could not secure the proxy workspace."
 
 				cat > "$LOCATION_FRAGMENT" <<- SINGLE_PROXY
-					location / {
-						proxy_pass http://127.0.0.1:$BACKEND_PORT;
+					    location / {
+					        proxy_pass http://127.0.0.1:$BACKEND_PORT;
 				SINGLE_PROXY
 
 				append_common_proxy_headers \
 					"$LOCATION_FRAGMENT" "$cpl_forwarded_port" 3600s
 
 				cat >> "$LOCATION_FRAGMENT" <<- SINGLE_PROXY_END
-					proxy_set_header Upgrade \$http_upgrade;
-					proxy_set_header Connection \$$WS_MAP_VAR;
-							}
+					        proxy_set_header Upgrade \$http_upgrade;
+					        proxy_set_header Connection \$$WS_MAP_VAR;
+					    }
 				SINGLE_PROXY_END
 
 				log_success "Selected backend port: $BACKEND_PORT"
@@ -2790,38 +2896,46 @@ write_https_site_config() {
 	fi
 
 	cat >> "$CURRENT_TMP" <<- HTTPS_HEADER
-		# Managed HTTPS reverse-proxy virtual host for $DOMAIN.
+		# nginx-manager: HTTPS reverse-proxy virtual host for $DOMAIN.
 		# Host validation is intentionally strict.
 
 		map \$http_upgrade \$$WS_MAP_VAR {
-			default upgrade;
-			'' close;
+		    default upgrade;
+		    '' close;
 		}
 
 		server {
-			$whsc_listen
-			server_name $DOMAIN;
+		    $whsc_listen
+	HTTPS_HEADER
 
-			if (\$host != "$DOMAIN") {
-				return 444;
-			}
+	if [ -n "${BODY_SIZE_MB:-}" ]; then
+		printf '    client_max_body_size %sm;\n' \
+			"$BODY_SIZE_MB" >> "$CURRENT_TMP" \
+			|| fatal "Could not append client_max_body_size to $whsc_target."
+	fi
 
-			server_tokens off;
+	cat >> "$CURRENT_TMP" <<- HTTPS_HEADER
+		    server_name $DOMAIN;
 
-			ssl_certificate $CERT_FILE;
-			ssl_certificate_key $KEY_FILE;
-			ssl_protocols TLSv1.2 TLSv1.3;
-			ssl_session_timeout 1d;
-			ssl_session_cache shared:SSL:10m;
-			ssl_session_tickets off;
+		    if (\$host != "$DOMAIN") {
+		        return 444;
+		    }
 
-			client_max_body_size 16m;
-			keepalive_timeout 65s;
+		    server_tokens off;
 
-			add_header Strict-Transport-Security "max-age=31536000" always;
-			add_header X-Content-Type-Options "nosniff" always;
-			add_header X-Frame-Options "SAMEORIGIN" always;
-			add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+		    ssl_certificate $CERT_FILE;
+		    ssl_certificate_key $KEY_FILE;
+		    ssl_protocols TLSv1.2 TLSv1.3;
+		    ssl_session_timeout 1d;
+		    ssl_session_cache shared:SSL:10m;
+		    ssl_session_tickets off;
+
+		    keepalive_timeout 65s;
+
+		    add_header Strict-Transport-Security "max-age=31536000" always;
+		    add_header X-Content-Type-Options "nosniff" always;
+		    add_header X-Frame-Options "SAMEORIGIN" always;
+		    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
 
 	HTTPS_HEADER
 
@@ -2851,52 +2965,60 @@ write_custom_config() {
 	fi
 
 	cat >> "$CURRENT_TMP" <<- CUSTOM_CONFIG
-		# Managed custom-port HTTP/HTTPS reverse proxy for $DOMAIN.
+		# nginx-manager: Custom-port HTTP/HTTPS reverse proxy for $DOMAIN.
 		# This file does not alter public port-80 or port-443 routing.
 
 		map \$http_upgrade \$$WS_MAP_VAR {
-			default upgrade;
-			'' close;
+		    default upgrade;
+		    '' close;
 		}
 
 		server {
-			listen $HTTP_PORT;
-			${IPV6_LISTEN_PREFIX}listen [::]:$HTTP_PORT;
-			server_name $DOMAIN;
+		    listen $HTTP_PORT;
+		    ${IPV6_LISTEN_PREFIX}listen [::]:$HTTP_PORT;
+		    server_name $DOMAIN;
 
-			if (\$host != "$DOMAIN") {
-				return 444;
-			}
+		    if (\$host != "$DOMAIN") {
+		        return 444;
+		    }
 
-			server_tokens off;
-			return 301 https://\$host:$HTTPS_PORT\$request_uri;
+		    server_tokens off;
+		    return 301 https://\$host:$HTTPS_PORT\$request_uri;
 		}
 
 		server {
-			listen $HTTPS_PORT ssl;
-			${IPV6_LISTEN_PREFIX}listen [::]:$HTTPS_PORT ssl;
-			server_name $DOMAIN;
+		    listen $HTTPS_PORT ssl;
+		    ${IPV6_LISTEN_PREFIX}listen [::]:$HTTPS_PORT ssl;
+	CUSTOM_CONFIG
 
-			if (\$host != "$DOMAIN") {
-				return 444;
-			}
+	if [ -n "${BODY_SIZE_MB:-}" ]; then
+		printf '    client_max_body_size %sm;\n' \
+			"$BODY_SIZE_MB" >> "$CURRENT_TMP" \
+			|| fatal "Could not append client_max_body_size to $wcmc_target."
+	fi
 
-			server_tokens off;
+	cat >> "$CURRENT_TMP" <<- CUSTOM_CONFIG
+		    server_name $DOMAIN;
 
-			ssl_certificate $CERT_FILE;
-			ssl_certificate_key $KEY_FILE;
-			ssl_protocols TLSv1.2 TLSv1.3;
-			ssl_session_timeout 1d;
-			ssl_session_cache shared:SSL:10m;
-			ssl_session_tickets off;
+		    if (\$host != "$DOMAIN") {
+		        return 444;
+		    }
 
-			client_max_body_size 16m;
-			keepalive_timeout 65s;
+		    server_tokens off;
 
-			add_header Strict-Transport-Security "max-age=31536000" always;
-			add_header X-Content-Type-Options "nosniff" always;
-			add_header X-Frame-Options "SAMEORIGIN" always;
-			add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+		    ssl_certificate $CERT_FILE;
+		    ssl_certificate_key $KEY_FILE;
+		    ssl_protocols TLSv1.2 TLSv1.3;
+		    ssl_session_timeout 1d;
+		    ssl_session_cache shared:SSL:10m;
+		    ssl_session_tickets off;
+
+		    keepalive_timeout 65s;
+
+		    add_header Strict-Transport-Security "max-age=31536000" always;
+		    add_header X-Content-Type-Options "nosniff" always;
+		    add_header X-Frame-Options "SAMEORIGIN" always;
+		    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
 
 	CUSTOM_CONFIG
 
@@ -2921,9 +3043,24 @@ configure_domain_mode() {
 
 	if confirm "Use Nginx-managed certificates?" yes; then
 		TLS_PASSTHROUGH=0
+		client_max_body_size 443
 		select_certificate_paths
 		validate_certificate_pair
+	else
+		client_max_body_size 443
 
+		if [ -n "${BODY_SIZE_MB:-}" ]; then
+			TLS_PASSTHROUGH=0
+			bootstrap_certificate_pair
+			validate_certificate_pair
+			log_info "The custom client_max_body_size will be enforced by an internal Nginx HTTPS node on a randomly selected loopback port."
+		else
+			TLS_PASSTHROUGH=1
+			prompt_raw_tls_backend_port
+		fi
+	fi
+
+	if [ "$TLS_PASSTHROUGH" -eq 0 ]; then
 		find_random_port 10000 19999
 		TLS_INTERNAL_PORT=$SELECTED_FREE_PORT
 		unset SELECTED_FREE_PORT
@@ -2932,9 +3069,6 @@ configure_domain_mode() {
 		log_success "Selected internal TLS listener port: $TLS_INTERNAL_PORT"
 
 		choose_proxy_layout 443
-	else
-		TLS_PASSTHROUGH=1
-		prompt_raw_tls_backend_port
 	fi
 
 	ensure_stream_include
@@ -2985,10 +3119,24 @@ configure_custom_port_mode() {
 
 	if confirm "Use Nginx-managed certificates?" yes; then
 		TLS_PASSTHROUGH=0
-		WS_MAP_VAR=$(websocket_map_variable "$DOMAIN")
-
+		client_max_body_size "$HTTPS_PORT"
 		select_certificate_paths
 		validate_certificate_pair
+	else
+		client_max_body_size "$HTTPS_PORT"
+
+		if [ -n "${BODY_SIZE_MB:-}" ]; then
+			TLS_PASSTHROUGH=0
+			bootstrap_certificate_pair
+			validate_certificate_pair
+			log_info "The custom client_max_body_size will be enforced by an Nginx HTTPS reverse-proxy node on port $HTTPS_PORT."
+		else
+			TLS_PASSTHROUGH=1
+		fi
+	fi
+
+	if [ "$TLS_PASSTHROUGH" -eq 0 ]; then
+		WS_MAP_VAR=$(websocket_map_variable "$DOMAIN")
 		choose_proxy_layout "$HTTPS_PORT"
 
 		ccpm_token=$(bounded_domain_token "$DOMAIN" 72)
@@ -3005,7 +3153,6 @@ configure_custom_port_mode() {
 		log_success "The custom-port HTTP/HTTPS configuration passed validation and was installed."
 		unset ccpm_token ccpm_target WS_MAP_VAR LOCATION_FRAGMENT UPSTREAM_FRAGMENT
 	else
-		TLS_PASSTHROUGH=1
 		prompt_raw_tls_backend_port
 		ensure_stream_include
 		write_forced_ssl_snippet "$HTTPS_PORT"
@@ -3260,12 +3407,8 @@ replace_upstream_port_candidate() {
 				matched = substr(text, RSTART, RLENGTH)
 				leading = ""
 				trailing = ""
-				if (substr(matched, 1, 1) !~ /[0-9]/) {
-					leading = substr(matched, 1, 1)
-				}
-				if (substr(matched, length(matched), 1) !~ /[0-9]/) {
-					trailing = substr(matched, length(matched), 1)
-				}
+				if (substr(matched, 1, 1) !~ /[0-9]/) leading = substr(matched, 1, 1)
+				if (substr(matched, length(matched), 1) !~ /[0-9]/) trailing = substr(matched, length(matched), 1)
 				before = substr(text, 1, RSTART - 1)
 				after = substr(text, RSTART + RLENGTH)
 				text = before leading new_port trailing after
@@ -3276,11 +3419,17 @@ replace_upstream_port_candidate() {
 			in_upstream = 0
 			depth = 0
 			matched_server = 0
+			new_name = wanted_name
+			public_443_prefix = "sni_" old_port "_443_"
+			if (index(wanted_name, public_443_prefix) == 1) {
+				new_name = "sni_" new_port "_443_" substr(wanted_name, length(public_443_prefix) + 1)
+			}
 		}
 		{
 			line = $0
-			if (!in_upstream && line ~ /^[[:space:]]*upstream[[:space:]]+/) {
-				name = line
+			original_line = line
+			if (!in_upstream && original_line ~ /^[[:space:]]*upstream[[:space:]]+/) {
+				name = original_line
 				sub(/^[[:space:]]*upstream[[:space:]]+/, "", name)
 				sub(/[[:space:]]*\{.*$/, "", name)
 				if (name == wanted_name) {
@@ -3288,9 +3437,9 @@ replace_upstream_port_candidate() {
 					depth = 0
 				}
 			}
-
-			if (in_upstream && line ~ /^[[:space:]]*server[[:space:]]+/) {
-				value = line
+			if (new_name != wanted_name) gsub(wanted_name, new_name, line)
+			if (in_upstream && original_line ~ /^[[:space:]]*server[[:space:]]+/) {
+				value = original_line
 				sub(/^[[:space:]]*server[[:space:]]+/, "", value)
 				sub(/;[[:space:]]*$/, "", value)
 				value = trim(value)
@@ -3299,18 +3448,14 @@ replace_upstream_port_candidate() {
 					matched_server = 1
 				}
 			}
-
 			print line
-
 			if (in_upstream) {
-				opening = $0
-				closing = $0
+				opening = original_line
+				closing = original_line
 				open_count = gsub(/\{/, "", opening)
 				close_count = gsub(/\}/, "", closing)
 				depth += open_count - close_count
-				if (depth == 0) {
-					in_upstream = 0
-				}
+				if (depth == 0) in_upstream = 0
 			}
 		}
 		END { exit(matched_server ? 0 : 2) }
@@ -3909,8 +4054,19 @@ print_summary() {
 
 	if [ "${TLS_PASSTHROUGH:-0}" -eq 1 ]; then
 		printf '  TLS handling:         Raw TLS passthrough\n'
+		printf '  Client body limit:    Backend-controlled (not available in Nginx stream context)\n'
 	else
-		printf '  TLS handling:         Nginx-managed certificates\n'
+		if [ "${CERT_FILE:-}" = "$NGINX_CONF_DIR/certs/cert.pem" ] \
+			&& [ "${KEY_FILE:-}" = "$NGINX_CONF_DIR/certs/cert.key" ]; then
+			printf '  TLS handling:         Nginx termination with bootstrap certificate\n'
+		else
+			printf '  TLS handling:         Nginx-managed certificates\n'
+		fi
+		if [ -n "${BODY_SIZE_MB:-}" ]; then
+			printf '  Client body limit:    %s MB\n' "$BODY_SIZE_MB"
+		else
+			printf '  Client body limit:    Nginx default\n'
+		fi
 		printf '  Certificate:          %s\n' "$CERT_FILE"
 		printf '  Private key:          %s\n' "$KEY_FILE"
 		printf '  Site configuration:   %s\n' "$SITE_CONFIG"
@@ -3950,7 +4106,7 @@ print_summary() {
 
 	unset MODE DOMAIN CERT_FILE KEY_FILE SITE_CONFIG STREAM_CONFIG \
 		HTTP_REDIRECT_CONFIG REDIRECT_SNIPPET TLS_INTERNAL_PORT HTTP_PORT \
-		HTTPS_PORT BACKEND_PORT TLS_PASSTHROUGH
+		HTTPS_PORT BACKEND_PORT TLS_PASSTHROUGH BODY_SIZE_MB
 }
 
 main() {
@@ -4003,7 +4159,7 @@ main() {
 		IPV6_ENABLED IPV6_LISTEN_PREFIX STATE_FILE MANAGED_EXISTING \
 		MANAGED_INSTALLED_AT MANAGED_LAST_CONFIGURED_AT TLS_PASSTHROUGH \
 		HTTP_REDIRECT_CONFIG REDIRECT_SNIPPET MANAGED_NODE_ACTION \
-		MANAGED_NODE_DESCRIPTION MANAGED_NEW_PORT
+		MANAGED_NODE_DESCRIPTION MANAGED_NEW_PORT BODY_SIZE_MB
 
 	log_success "Nginx reverse-proxy configuration completed."
 }

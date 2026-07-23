@@ -151,7 +151,8 @@ reset_internal_state() {
 		WS_MAP_VAR PROMPTED_FILE PROMPTED_PORT SELECTED_FREE_PORT IPV6_ENABLED \
 		IPV6_LISTEN_PREFIX STATE_FILE MANAGED_EXISTING MANAGED_INSTALLED_AT \
 		MANAGED_LAST_CONFIGURED_AT MANAGED_NODE_ACTION MANAGED_NODE_DESCRIPTION \
-		MANAGED_NEW_PORT BODY_SIZE_MB
+		MANAGED_NEW_PORT BODY_SIZE_MB CA_FILE SSL_CERTIFICATE_FILE \
+		GENERATED_CHAIN_FILE
 }
 
 initialize_runtime_paths() {
@@ -1545,6 +1546,135 @@ select_certificate_paths() {
 	unset scp_found scp_pair scp_cert scp_key
 }
 
+select_ca_certificate() {
+	unset CA_FILE SSL_CERTIFICATE_FILE GENERATED_CHAIN_FILE
+	soc_cert_dir=$(dirname "$CERT_FILE")
+	soc_found=
+	soc_seen='|'
+
+	# Auto-detection is intentionally restricted to the exact filename
+	# "{domain}.ca". No alternate CA extensions or generic bundle names
+	# are considered automatically.
+	for soc_candidate in \
+		"$soc_cert_dir/$DOMAIN.ca" \
+		"$NGINX_CONF_DIR/certs/$DOMAIN.ca" \
+		"/etc/certs/$DOMAIN/$DOMAIN.ca" \
+		"/etc/certs/$DOMAIN.ca" \
+		"$NGINX_CONF_DIR/ssl/$DOMAIN.ca" \
+		"/etc/ssl/$DOMAIN/$DOMAIN.ca"; do
+		case $soc_seen in
+			*"|$soc_candidate|"*)
+				continue
+				;;
+		esac
+		soc_seen="${soc_seen}${soc_candidate}|"
+
+		if [ -f "$soc_candidate" ] && [ -r "$soc_candidate" ]; then
+			soc_found=$soc_candidate
+			break
+		fi
+	done
+
+	if [ -n "$soc_found" ]; then
+		log_success "Detected CA/intermediate certificate: $soc_found"
+		if confirm "Use this detected CA/intermediate certificate?" yes; then
+			CA_FILE=$soc_found
+		elif confirm "Select a different CA/intermediate certificate?" no; then
+			prompt_existing_file "Enter the full CA/intermediate certificate path"
+			CA_FILE=$PROMPTED_FILE
+			unset PROMPTED_FILE
+		else
+			log_info "No CA/intermediate certificate will be configured for this HTTPS node."
+		fi
+	elif confirm "Add an optional CA/intermediate certificate for this HTTPS node?" no; then
+		prompt_existing_file "Enter the full CA/intermediate certificate path"
+		CA_FILE=$PROMPTED_FILE
+		unset PROMPTED_FILE
+	else
+		log_info "No CA/intermediate certificate will be configured for this HTTPS node."
+	fi
+
+	if [ -n "${CA_FILE:-}" ]; then
+		[ "$CA_FILE" != "$CERT_FILE" ] \
+			|| fatal "The CA/intermediate certificate must be separate from the leaf certificate file."
+		[ "$CA_FILE" != "$KEY_FILE" ] \
+			|| fatal "The CA/intermediate certificate path cannot be the private key file."
+	fi
+
+	unset soc_cert_dir soc_found soc_seen soc_candidate
+}
+
+validate_optional_ca_certificate() {
+	[ -n "${CA_FILE:-}" ] || return 0
+
+	command_exists openssl \
+		|| fatal "OpenSSL is required to validate the selected CA/intermediate certificate."
+
+	if ! grep -F -- '-----BEGIN CERTIFICATE-----' "$CA_FILE" > /dev/null 2>&1 \
+		|| ! openssl crl2pkcs7 -nocrl -certfile "$CA_FILE" -outform PEM \
+			> /dev/null 2>&1; then
+		fatal "The selected CA/intermediate file is not a valid PEM certificate bundle: $CA_FILE"
+	fi
+
+	log_success "CA/intermediate certificate validation passed: $CA_FILE"
+}
+
+prepare_certificate_chain() {
+	pcc_https_port=$1
+	SSL_CERTIFICATE_FILE=$CERT_FILE
+	unset GENERATED_CHAIN_FILE
+
+	[ -n "${CA_FILE:-}" ] || {
+		unset pcc_https_port
+		return 0
+	}
+
+	validate_optional_ca_certificate
+	pcc_token=$(bounded_domain_token "$DOMAIN" 72)
+	pcc_target="$NGINX_CONF_DIR/certs/.nginx-manager_${pcc_token}_${pcc_https_port}.fullchain.pem"
+	make_temp_for "$pcc_target"
+
+	{
+		cat "$CERT_FILE"
+		printf '\n'
+		cat "$CA_FILE"
+		printf '\n'
+	} > "$CURRENT_TMP" \
+		|| fatal "Could not build the certificate chain for HTTPS port $pcc_https_port."
+
+	if ! openssl crl2pkcs7 -nocrl -certfile "$CURRENT_TMP" -outform PEM \
+		> /dev/null 2>&1; then
+		fatal "The generated leaf-plus-intermediate certificate chain is invalid."
+	fi
+
+	chmod 0644 "$CURRENT_TMP" \
+		|| fatal "Could not set permissions on the generated certificate chain."
+
+	if [ -e "$pcc_target" ] || [ -L "$pcc_target" ]; then
+		backup_existing_file "$pcc_target" \
+			|| fatal "Could not back up the existing generated certificate chain."
+	else
+		record_change N "$pcc_target" ""
+	fi
+
+	mv -f "$CURRENT_TMP" "$pcc_target" \
+		|| fatal "Could not install the generated certificate chain: $pcc_target"
+	unset CURRENT_TMP
+
+	SSL_CERTIFICATE_FILE=$pcc_target
+	GENERATED_CHAIN_FILE=$pcc_target
+	log_success "Generated certificate chain: $pcc_target"
+
+	unset pcc_https_port pcc_token pcc_target
+}
+
+configure_ca_certificate() {
+	cocc_https_port=$1
+	select_ca_certificate
+	prepare_certificate_chain "$cocc_https_port"
+	unset cocc_https_port
+}
+
 bootstrap_certificate_pair() {
 	ubcp_certificate="$NGINX_CONF_DIR/certs/cert.pem"
 	ubcp_private_key="$NGINX_CONF_DIR/certs/cert.key"
@@ -2923,8 +3053,17 @@ write_https_site_config() {
 
 		    server_tokens off;
 
-		    ssl_certificate $CERT_FILE;
+		    ssl_certificate $SSL_CERTIFICATE_FILE;
 		    ssl_certificate_key $KEY_FILE;
+	HTTPS_HEADER
+
+	if [ -n "${CA_FILE:-}" ]; then
+		printf '    ssl_trusted_certificate %s;\n' "$CA_FILE" \
+			>> "$CURRENT_TMP" \
+			|| fatal "Could not append the CA/intermediate certificate directive to $whsc_target."
+	fi
+
+	cat >> "$CURRENT_TMP" <<- HTTPS_HEADER
 		    ssl_protocols TLSv1.2 TLSv1.3;
 		    ssl_session_timeout 1d;
 		    ssl_session_cache shared:SSL:10m;
@@ -3006,8 +3145,17 @@ write_custom_config() {
 
 		    server_tokens off;
 
-		    ssl_certificate $CERT_FILE;
+		    ssl_certificate $SSL_CERTIFICATE_FILE;
 		    ssl_certificate_key $KEY_FILE;
+	CUSTOM_CONFIG
+
+	if [ -n "${CA_FILE:-}" ]; then
+		printf '    ssl_trusted_certificate %s;\n' "$CA_FILE" \
+			>> "$CURRENT_TMP" \
+			|| fatal "Could not append the CA/intermediate certificate directive to $wcmc_target."
+	fi
+
+	cat >> "$CURRENT_TMP" <<- CUSTOM_CONFIG
 		    ssl_protocols TLSv1.2 TLSv1.3;
 		    ssl_session_timeout 1d;
 		    ssl_session_cache shared:SSL:10m;
@@ -3045,6 +3193,7 @@ configure_domain_mode() {
 		TLS_PASSTHROUGH=0
 		select_certificate_paths
 		validate_certificate_pair
+		configure_ca_certificate 443
 		client_max_body_size 443
 	else
 		client_max_body_size 443
@@ -3053,6 +3202,7 @@ configure_domain_mode() {
 			TLS_PASSTHROUGH=0
 			bootstrap_certificate_pair
 			validate_certificate_pair
+			configure_ca_certificate 443
 			log_info "The custom client_max_body_size will be enforced by an internal Nginx HTTPS node on a randomly selected loopback port."
 		else
 			TLS_PASSTHROUGH=1
@@ -3121,6 +3271,7 @@ configure_custom_port_mode() {
 		TLS_PASSTHROUGH=0
 		select_certificate_paths
 		validate_certificate_pair
+		configure_ca_certificate "$HTTPS_PORT"
 		client_max_body_size "$HTTPS_PORT"
 	else
 		client_max_body_size "$HTTPS_PORT"
@@ -3129,6 +3280,7 @@ configure_custom_port_mode() {
 			TLS_PASSTHROUGH=0
 			bootstrap_certificate_pair
 			validate_certificate_pair
+			configure_ca_certificate "$HTTPS_PORT"
 			log_info "The custom client_max_body_size will be enforced by an Nginx HTTPS reverse-proxy node on port $HTTPS_PORT."
 		else
 			TLS_PASSTHROUGH=1
@@ -4069,6 +4221,12 @@ print_summary() {
 		fi
 		printf '  Certificate:          %s\n' "$CERT_FILE"
 		printf '  Private key:          %s\n' "$KEY_FILE"
+		if [ -n "${CA_FILE:-}" ]; then
+			printf '  CA/intermediate:      %s\n' "$CA_FILE"
+			printf '  Served chain:         %s\n' "$SSL_CERTIFICATE_FILE"
+		else
+			printf '  CA/intermediate:      Not configured\n'
+		fi
 		printf '  Site configuration:   %s\n' "$SITE_CONFIG"
 	fi
 
@@ -4104,9 +4262,10 @@ print_summary() {
 
 	printf '  Transaction backups: %s\n\n' "$BACKUP_DIR"
 
-	unset MODE DOMAIN CERT_FILE KEY_FILE SITE_CONFIG STREAM_CONFIG \
-		HTTP_REDIRECT_CONFIG REDIRECT_SNIPPET TLS_INTERNAL_PORT HTTP_PORT \
-		HTTPS_PORT BACKEND_PORT TLS_PASSTHROUGH BODY_SIZE_MB
+	unset MODE DOMAIN CERT_FILE KEY_FILE CA_FILE SSL_CERTIFICATE_FILE \
+		GENERATED_CHAIN_FILE SITE_CONFIG STREAM_CONFIG HTTP_REDIRECT_CONFIG \
+		REDIRECT_SNIPPET TLS_INTERNAL_PORT HTTP_PORT HTTPS_PORT BACKEND_PORT \
+		TLS_PASSTHROUGH BODY_SIZE_MB
 }
 
 main() {
@@ -4159,7 +4318,8 @@ main() {
 		IPV6_ENABLED IPV6_LISTEN_PREFIX STATE_FILE MANAGED_EXISTING \
 		MANAGED_INSTALLED_AT MANAGED_LAST_CONFIGURED_AT TLS_PASSTHROUGH \
 		HTTP_REDIRECT_CONFIG REDIRECT_SNIPPET MANAGED_NODE_ACTION \
-		MANAGED_NODE_DESCRIPTION MANAGED_NEW_PORT BODY_SIZE_MB
+		MANAGED_NODE_DESCRIPTION MANAGED_NEW_PORT BODY_SIZE_MB CA_FILE \
+		SSL_CERTIFICATE_FILE GENERATED_CHAIN_FILE
 
 	log_success "Nginx reverse-proxy configuration completed."
 }

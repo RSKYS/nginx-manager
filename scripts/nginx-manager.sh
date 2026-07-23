@@ -1604,7 +1604,7 @@ select_ca_certificate() {
 	unset soc_cert_dir soc_found soc_seen soc_candidate
 }
 
-validate_optional_ca_certificate() {
+validate_ca_certificate() {
 	[ -n "${CA_FILE:-}" ] || return 0
 
 	command_exists openssl \
@@ -1624,48 +1624,12 @@ prepare_certificate_chain() {
 	SSL_CERTIFICATE_FILE=$CERT_FILE
 	unset GENERATED_CHAIN_FILE
 
-	[ -n "${CA_FILE:-}" ] || {
-		unset pcc_https_port
-		return 0
-	}
-
-	validate_optional_ca_certificate
-	pcc_token=$(bounded_domain_token "$DOMAIN" 72)
-	pcc_target="$NGINX_CONF_DIR/certs/.nginx-manager_${pcc_token}_${pcc_https_port}.fullchain.pem"
-	make_temp_for "$pcc_target"
-
-	{
-		cat "$CERT_FILE"
-		printf '\n'
-		cat "$CA_FILE"
-		printf '\n'
-	} > "$CURRENT_TMP" \
-		|| fatal "Could not build the certificate chain for HTTPS port $pcc_https_port."
-
-	if ! openssl crl2pkcs7 -nocrl -certfile "$CURRENT_TMP" -outform PEM \
-		> /dev/null 2>&1; then
-		fatal "The generated leaf-plus-intermediate certificate chain is invalid."
+	if [ -n "${CA_FILE:-}" ]; then
+		validate_ca_certificate
+		log_success "The selected certificate path will be used unchanged for HTTPS port $pcc_https_port: $CERT_FILE"
 	fi
 
-	chmod 0644 "$CURRENT_TMP" \
-		|| fatal "Could not set permissions on the generated certificate chain."
-
-	if [ -e "$pcc_target" ] || [ -L "$pcc_target" ]; then
-		backup_existing_file "$pcc_target" \
-			|| fatal "Could not back up the existing generated certificate chain."
-	else
-		record_change N "$pcc_target" ""
-	fi
-
-	mv -f "$CURRENT_TMP" "$pcc_target" \
-		|| fatal "Could not install the generated certificate chain: $pcc_target"
-	unset CURRENT_TMP
-
-	SSL_CERTIFICATE_FILE=$pcc_target
-	GENERATED_CHAIN_FILE=$pcc_target
-	log_success "Generated certificate chain: $pcc_target"
-
-	unset pcc_https_port pcc_token pcc_target
+	unset pcc_https_port
 }
 
 configure_ca_certificate() {
@@ -3053,7 +3017,7 @@ write_https_site_config() {
 
 		    server_tokens off;
 
-		    ssl_certificate $SSL_CERTIFICATE_FILE;
+		    ssl_certificate $CERT_FILE;
 		    ssl_certificate_key $KEY_FILE;
 	HTTPS_HEADER
 
@@ -3145,7 +3109,7 @@ write_custom_config() {
 
 		    server_tokens off;
 
-		    ssl_certificate $SSL_CERTIFICATE_FILE;
+		    ssl_certificate $CERT_FILE;
 		    ssl_certificate_key $KEY_FILE;
 	CUSTOM_CONFIG
 
@@ -4223,7 +4187,6 @@ print_summary() {
 		printf '  Private key:          %s\n' "$KEY_FILE"
 		if [ -n "${CA_FILE:-}" ]; then
 			printf '  CA/intermediate:      %s\n' "$CA_FILE"
-			printf '  Served chain:         %s\n' "$SSL_CERTIFICATE_FILE"
 		else
 			printf '  CA/intermediate:      Not configured\n'
 		fi

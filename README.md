@@ -6,9 +6,12 @@ Set of my masterpiece web tools; Meant to be very simple to manage.
 
 Contain these binaries:
 
-- nginx-manager
-- mysql-generator
+- atomic-merger
+- atomic-scanner
 - gen-hestia-node
+- mysql-generator
+- nginx-manager
+- port-scanner
 
 ---
 

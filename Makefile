@@ -19,9 +19,8 @@ install: build
 		basename=$${name%.*}
 		case "$$name" in
 			*.c)
-				gcc \
-					-fhardened -O2 \
-					-Wall -Wextra \
+				gcc -O2 -Wall \
+					-Wextra \
 					-Wformat=2 \
 					-Wformat-security \
 					-Wmissing-prototypes \

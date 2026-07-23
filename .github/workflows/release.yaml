@@ -17,8 +17,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - target_arch: armv7
+            deb_arch: armhf
           - target_arch: aarch64
             deb_arch: arm64
+          - target_arch: i386
+            deb_arch: i386
           - target_arch: amd64
             deb_arch: amd64
 
@@ -231,8 +235,8 @@ jobs:
               -print0
           )
 
-          if [[ "${#packages[@]}" -ne 2 ]]; then
-            printf 'Expected exactly two .deb packages, found %s\n' \
+          if [[ "${#packages[@]}" -ne 4 ]]; then
+            printf 'Expected exactly four .deb packages, found %s\n' \
               "${#packages[@]}" >&2
             printf '%s\n' "${packages[@]}" >&2
             exit 1
@@ -248,7 +252,7 @@ jobs:
             )"
 
             case "$architecture" in
-              amd64 | arm64)
+              amd64 | arm64 | armhf | i386)
                 ;;
               *)
                 printf 'Unexpected Debian architecture %s in package %s\n' \
@@ -278,7 +282,7 @@ jobs:
             dpkg-deb --contents "$package"
           done
 
-          for required_architecture in amd64 arm64; do
+          for required_architecture in amd64 arm64 armhf i386; do
             if [[ -z \
               "${discovered_architectures[$required_architecture]:-}" ]]; then
               printf 'Missing package for architecture: %s\n' \
